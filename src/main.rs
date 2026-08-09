@@ -3,9 +3,11 @@ mod app;
 mod components;
 mod config;
 mod core;
+mod manifest_file;
 mod styles;
 mod theme;
 mod views;
+mod xdg;
 
 use app::App;
 use gpui::{AppContext as _, Application, WindowOptions, px, size};

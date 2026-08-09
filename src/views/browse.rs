@@ -159,14 +159,26 @@ impl App {
         };
 
         // Build the browse list
+        // The search box and what it found stay put while the results move,
+        // so the box is always there to type in.
+        let search_header = div()
+            .flex_shrink_0()
+            .w_full()
+            .px(px(styles::spacing::XL))
+            .pt(px(styles::spacing::XL))
+            .pb(px(styles::spacing::SM))
+            .flex()
+            .flex_col()
+            .gap(px(styles::spacing::SM))
+            .child(search_bar)
+            .child(result_count);
+
         let mut browse_list = div()
             .flex_1()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::SM))
             .w_full()
-            .child(search_bar)
-            .child(result_count)
             .child(results_content);
 
         // Install error banner
@@ -234,33 +246,52 @@ impl App {
         }
 
         let browse_panel = div()
-            .id("browse-scroll")
             .flex_1()
             .min_h_0()
             .min_w_0()
             .w_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .child(search_header)
             .child(
                 div()
-                    .p(px(styles::spacing::XL))
-                    .flex()
-                    .flex_col()
-                    .w_full()
+                    .id("browse-scroll")
+                    .flex_1()
+                    .min_h_0()
                     .min_w_0()
-                    .child(browse_list),
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px(px(styles::spacing::XL))
+                            .pb(px(styles::spacing::XL))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .min_w_0()
+                            .child(browse_list),
+                    ),
             );
 
         // Detail side panel
         if let Some(ref pkg) = self.browse_state.selected_package.clone() {
             div()
                 .flex_1()
+                .min_h_0()
+                .min_w_0()
                 .flex()
                 .flex_row()
                 .child(browse_panel)
                 .child(div().w(px(1.0)).h_full().bg(border))
                 .child(self.render_detail_panel(pkg, theme, cx))
         } else {
-            div().flex_1().flex().flex_row().child(browse_panel)
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .child(browse_panel)
         }
     }
 
@@ -526,10 +557,13 @@ impl App {
         });
 
         let mut content = div()
+            .id("detail-scroll")
             .flex_shrink()
             .w(px(320.0))
             .min_w(px(220.0))
             .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
             .bg(surface)
             .border_l_1()
             .border_color(border)
@@ -658,47 +692,34 @@ impl App {
                 div()
                     .text_size(px(styles::font_size::CAPTION))
                     .text_color(text_muted)
-                    .child(format!("Detail unavailable: {err}")),
+                    .child(err.clone()),
             );
         } else if let Some(ref detail) = self.browse_state.selected_detail {
-            if !detail.maintainers.is_empty() {
-                content = content.child(self.detail_row(
-                    "Maintainers",
-                    &detail.maintainers.join(", "),
-                    theme,
-                ));
+            // What the search result carried is already shown above, so these
+            // fill in only what the detail lookup added.
+            if pkg.homepage.is_none()
+                && let Some(ref homepage) = detail.package.homepage
+            {
+                content = content.child(self.detail_row("Homepage", homepage, theme));
+            }
+            if pkg.license.is_none()
+                && let Some(ref license) = detail.package.license
+            {
+                content = content.child(self.detail_row("License", license, theme));
+            }
+            if pkg.category.is_none()
+                && let Some(ref category) = detail.package.category
+            {
+                content = content.child(self.detail_row("Category", category, theme));
+            }
+            if let Some(ref kind) = detail.pkg_type {
+                content = content.child(self.detail_row("Type", kind, theme));
+            }
+            if let Some(ref source) = detail.source {
+                content = content.child(self.detail_row("Source", source, theme));
             }
             if let Some(ref date) = detail.build_date {
-                content = content.child(self.detail_row("Build date", date, theme));
-            }
-            if !detail.dependencies.is_empty() {
-                let deps = detail
-                    .dependencies
-                    .iter()
-                    .map(|d| {
-                        if let Some(ref req) = d.version_req {
-                            format!("{} ({req})", d.name)
-                        } else {
-                            d.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                content = content.child(self.detail_row("Dependencies", &deps, theme));
-            }
-            if let Some(ref readme) = detail.readme {
-                content = content.child(div().w_full().h(px(1.0)).bg(border));
-                content = content.child(
-                    div()
-                        .text_size(px(styles::font_size::SMALL))
-                        .text_color(text_muted)
-                        .child("Readme"),
-                );
-                content = content.child(
-                    div()
-                        .text_size(px(styles::font_size::CAPTION))
-                        .child(readme.clone()),
-                );
+                content = content.child(self.detail_row("Build date", &on_day(date), theme));
             }
         }
 
@@ -722,20 +743,27 @@ impl App {
 
         if !pkg.installed {
             let detail_pkey = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
+            // Only work still going counts. A record left by something that
+            // already finished would otherwise stand in for the button.
             let is_installing = self
                 .browse_state
                 .package_progress
-                .contains_key(&detail_pkey)
+                .get(&detail_pkey)
+                .is_some_and(|status| !status.is_finished())
                 || self.browse_state.installing.as_deref() == Some(&pkg.id);
             if is_installing {
+                // The panel is narrow and shares its width with Close, so the
+                // status says the least that still means something.
                 let status_label = self
                     .browse_state
                     .package_progress
                     .get(&detail_pkey)
-                    .map(|s| s.label())
+                    .map(|s| s.short_label())
                     .unwrap_or_else(|| "Installing...".into());
                 buttons = buttons.child(
                     div()
+                        .flex_shrink()
+                        .min_w(px(0.0))
                         .px(px(styles::spacing::LG))
                         .py(px(styles::spacing::XS))
                         .rounded(px(styles::radius::MD))
@@ -793,12 +821,17 @@ impl App {
             .gap(px(styles::spacing::SM))
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(styles::font_size::SMALL))
                     .w(px(100.0))
                     .child(label.to_string()),
             )
             .child(
+                // Takes what is left and no more, so a long value wraps inside
+                // the panel rather than running off the edge of it.
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .text_size(px(styles::font_size::SMALL))
                     .child(value.to_string()),
             )
@@ -918,5 +951,25 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    }
+}
+
+/// The day part of a timestamp, which is as much of it as is worth showing.
+fn on_day(timestamp: &str) -> String {
+    timestamp
+        .split_once('T')
+        .map_or(timestamp, |(day, _)| day)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_day;
+
+    #[test]
+    fn a_timestamp_is_shown_as_the_day_it_names() {
+        assert_eq!(on_day("2026-04-05T06:37:57.756197230+00:00"), "2026-04-05");
+        assert_eq!(on_day("2026-04-05"), "2026-04-05");
+        assert_eq!(on_day(""), "");
     }
 }

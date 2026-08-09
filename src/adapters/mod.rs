@@ -1,2 +1,1 @@
-pub mod soar;
-pub mod wasm;
+pub mod command;

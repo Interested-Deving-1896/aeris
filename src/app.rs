@@ -5,10 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::*;
-use soar_events::SoarEvent;
 
 use crate::{
-    adapters::soar::SoarAdapter,
+    adapters::command::{self, CommandAdapter},
     config::AerisConfig,
     core::{
         adapter::Adapter, adapter_manager::AdapterManager, privilege::PackageMode,
@@ -109,10 +108,12 @@ impl std::fmt::Display for OperationType {
 #[derive(Debug, Clone)]
 pub enum OperationStatus {
     Starting,
-    Downloading { current: u64, total: u64 },
-    Verifying(String),
+    Downloading {
+        current: u64,
+        total: u64,
+    },
+    /// What the manager says it is doing, in its own words.
     Installing(String),
-    Removing(String),
     Completed,
     Failed(String),
 }
@@ -131,11 +132,35 @@ impl OperationStatus {
                     "Downloading...".into()
                 }
             }
-            OperationStatus::Verifying(stage) => format!("Verifying ({stage})..."),
             OperationStatus::Installing(phase) => format!("Installing ({phase})..."),
-            OperationStatus::Removing(phase) => format!("Removing ({phase})..."),
             OperationStatus::Completed => "Completed".into(),
             OperationStatus::Failed(e) => format!("Failed: {e}"),
+        }
+    }
+
+    /// Whether the work this describes is over, one way or the other.
+    ///
+    /// A record left behind by a finished operation says nothing about what
+    /// is happening now, and reading it as though it did leaves the last
+    /// thing that happened on screen forever.
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            OperationStatus::Completed | OperationStatus::Failed(_)
+        )
+    }
+
+    /// The same thing said in as few characters as it takes, for somewhere
+    /// too narrow to spell it out.
+    pub fn short_label(&self) -> String {
+        match self {
+            OperationStatus::Downloading { current, total } if *total > 0 => {
+                let percent = (*current as f64 / *total as f64 * 100.0) as u64;
+                format!("Downloading {percent}%")
+            }
+            OperationStatus::Installing(phase) => phase.clone(),
+            OperationStatus::Failed(_) => "Failed".into(),
+            other => other.label(),
         }
     }
 
@@ -225,12 +250,9 @@ pub(crate) fn list_package_binaries(
     out
 }
 
-/// Best-effort lookup of soar's bin directory for the active profile.
-pub(crate) fn soar_active_bin_path() -> Option<std::path::PathBuf> {
-    let config = soar_config::config::get_config();
-    let active = &config.default_profile;
-    let profile = config.profile.get(active)?;
-    Some(std::path::PathBuf::from(&profile.root_path).join("bin"))
+/// Where the manager links the commands it installs.
+pub(crate) fn active_bin_path(paths: &HashMap<String, String>) -> Option<std::path::PathBuf> {
+    paths.get("bin").map(std::path::PathBuf::from)
 }
 
 #[derive(Default)]
@@ -258,7 +280,14 @@ pub struct App {
     pub(crate) current_view: View,
     sidebar_expanded: bool,
     pub(crate) aeris_config: AerisConfig,
-    pub(crate) adapter: Arc<SoarAdapter>,
+    /// The manager aeris drives, absent when none could be reached.
+    pub(crate) adapter: Option<Arc<dyn Adapter>>,
+    /// Where the manager keeps its files, read once at startup. Aeris edits
+    /// some of them directly rather than through a command for every field.
+    pub(crate) paths: HashMap<String, String>,
+    /// When aeris last wrote the declarative file itself, so the watcher can
+    /// tell its own writes from someone else's.
+    last_self_write: std::cell::Cell<Option<Instant>>,
     pub(crate) adapter_manager: AdapterManager,
     pub(crate) adapter_view: AdapterViewState,
     pub(crate) confirm_dialog: Option<ConfirmAction>,
@@ -266,7 +295,6 @@ pub struct App {
     /// Running processes launched via Run, keyed by package unique_key.
     pub(crate) running_processes: HashMap<String, Vec<RunningProcess>>,
     next_run_id: u64,
-    event_receiver: std::sync::mpsc::Receiver<SoarEvent>,
     active_operation: Option<ActiveOperation>,
     package_progress: HashMap<String, OperationStatus>,
     next_operation_id: u64,
@@ -308,6 +336,24 @@ pub struct App {
     manifest_reload_due: Option<Instant>,
 }
 
+/// Turn a stage name as a manager reports it into one worth showing.
+fn readable(stage: &str) -> String {
+    let mut words = stage.replace('_', " ");
+    if let Some(first) = words.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+
+    words
+}
+
+fn missing_manifest() -> String {
+    "soar did not say where its packages file is".to_string()
+}
+
+/// Window during which a change arriving after one of our own writes is
+/// treated as ours and ignored by the watcher.
+const SELF_WRITE_DEBOUNCE: Duration = Duration::from_millis(750);
+
 /// Wait at least this long after a notify event before reloading. Coalesces
 /// the burst that an atomic rename produces and keeps us from racing partial
 /// writes from external editors.
@@ -318,14 +364,17 @@ const MANIFEST_RELOAD_COALESCE_MS: u64 = 200;
 /// itself is returned boxed so the caller can keep it alive without naming
 /// notify types across the field type.
 fn spawn_manifest_watcher(
-    adapter: &Arc<SoarAdapter>,
+    path: Option<&std::path::Path>,
 ) -> (
     Option<std::sync::mpsc::Receiver<()>>,
     Option<Box<dyn std::any::Any + Send>>,
 ) {
     use notify::{EventKind, RecursiveMode, Watcher};
 
-    let path = adapter.manifest_path();
+    let Some(path) = path else {
+        return (None, None);
+    };
+    let path = path.to_path_buf();
     let parent = match path.parent() {
         Some(p) => p.to_path_buf(),
         None => return (None, None),
@@ -363,36 +412,76 @@ fn spawn_manifest_watcher(
         }
     };
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
-        log::warn!("manifest watcher: failed to watch {}: {e}", parent.display());
+        log::warn!(
+            "manifest watcher: failed to watch {}: {e}",
+            parent.display()
+        );
         return (None, None);
     }
 
-    (Some(rx), Some(Box::new(watcher) as Box<dyn std::any::Any + Send>))
+    (
+        Some(rx),
+        Some(Box::new(watcher) as Box<dyn std::any::Any + Send>),
+    )
+}
+
+/// Register an adapter unless one already answers to its id.
+///
+/// Ids decide where settings are kept, so the one registered first keeps the
+/// name rather than being replaced by whatever was discovered later.
+fn register_new(manager: &mut AdapterManager, adapter: Arc<dyn Adapter>) {
+    let id = adapter.info().id.clone();
+
+    if manager.get_adapter(&id).is_some() {
+        log::warn!("Ignoring a second adapter named {id}");
+        return;
+    }
+
+    manager.register(adapter);
 }
 
 impl App {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let aeris_config = AerisConfig::load();
-        soar_config::config::init().expect("Failed to load soar config");
-        let soar_config = soar_config::config::get_config();
 
         let selected_theme = aeris_config.theme();
         let startup_view = aeris_config.startup_view();
 
-        let (adapter, event_receiver) =
-            SoarAdapter::new(soar_config).expect("Failed to initialize Soar adapter");
-        let adapter = Arc::new(adapter);
-
         let mut adapter_manager = AdapterManager::new();
-        adapter_manager.register(adapter.clone() as Arc<dyn Adapter>);
+        let mut startup_problem = None;
+        let mut paths = HashMap::new();
 
-        for result in crate::adapters::wasm::load_all_plugins() {
-            match result {
-                Ok(wasm_adapter) => {
-                    log::info!("Loaded plugin: {}", wasm_adapter.info().id);
-                    adapter_manager.register(Arc::new(wasm_adapter));
+        // Soar describes itself, so aeris drives whichever one is installed
+        // rather than the one it was built against.
+        let adapter: Option<Arc<dyn Adapter>> =
+            match CommandAdapter::from_command("soar", command::DESCRIBE_ARGS)
+                .map(CommandAdapter::as_builtin)
+            {
+                Ok(soar) => {
+                    log::info!("Driving soar {}", soar.info().version);
+                    paths = soar.file_paths().unwrap_or_else(|e| {
+                        log::warn!("soar did not say where its files are: {e}");
+                        HashMap::new()
+                    });
+
+                    let adapter: Arc<dyn Adapter> = Arc::new(soar);
+                    adapter_manager.register(adapter.clone());
+                    Some(adapter)
                 }
-                Err(e) => log::warn!("Failed to load plugin: {e}"),
+                Err(e) => {
+                    log::error!("Soar is unavailable: {e}");
+                    startup_problem = Some(format!("Soar is unavailable: {e}"));
+                    None
+                }
+            };
+
+        for result in crate::adapters::command::load_all() {
+            match result {
+                Ok(manifest_adapter) => {
+                    log::info!("Loaded adapter: {}", manifest_adapter.info().id);
+                    register_new(&mut adapter_manager, Arc::new(manifest_adapter));
+                }
+                Err(e) => log::warn!("Failed to load adapter: {e}"),
             }
         }
 
@@ -403,11 +492,15 @@ impl App {
         let default_mode = PackageMode::User;
         let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        let settings_state = views::settings::SettingsState::load(&aeris_config, adapter.as_ref());
+        let settings_state = match adapter.as_ref() {
+            Some(adapter) => views::settings::SettingsState::load(&aeris_config, adapter.as_ref()),
+            None => views::settings::SettingsState::default(),
+        };
 
         let search_input = cx.new(|cx| crate::components::TextInput::new(cx, "Search packages..."));
 
-        let (manifest_watcher_rx, manifest_watcher) = spawn_manifest_watcher(&adapter);
+        let (manifest_watcher_rx, manifest_watcher) =
+            spawn_manifest_watcher(paths.get("packages_config").map(std::path::Path::new));
 
         // Poll for progress events periodically
         cx.spawn(
@@ -438,17 +531,29 @@ impl App {
             sidebar_expanded: false,
             aeris_config,
             adapter,
+            paths,
+            last_self_write: std::cell::Cell::new(None),
             adapter_manager,
             adapter_view: AdapterViewState::default(),
             confirm_dialog: None,
             run_picker: None,
             running_processes: HashMap::new(),
             next_run_id: 1,
-            event_receiver,
             active_operation: None,
             package_progress: HashMap::new(),
             next_operation_id: 1,
-            toasts: Vec::new(),
+            toasts: startup_problem
+                .into_iter()
+                .map(|message| Toast {
+                    id: 0,
+                    level: ToastLevel::Error,
+                    message,
+                    created_at: Instant::now(),
+                    // Long enough to read, since nothing else explains why the
+                    // window is empty.
+                    duration: Duration::from_secs(30),
+                })
+                .collect(),
             next_toast_id: 1,
             batch_progress: None,
             progress_sender,
@@ -578,23 +683,84 @@ impl App {
         .detach();
     }
 
+    /// Where the declarative package file lives, for a manager that has one.
+    fn manifest_path(&self) -> Option<std::path::PathBuf> {
+        self.paths
+            .get("packages_config")
+            .map(std::path::PathBuf::from)
+    }
+
+    /// Remember that the next change to the file is ours, so the watcher does
+    /// not read it back as though someone else had edited it.
+    fn mark_self_write(&self) {
+        self.last_self_write.set(Some(Instant::now()));
+    }
+
+    fn is_recent_self_write(&self) -> bool {
+        self.last_self_write
+            .get()
+            .is_some_and(|at| at.elapsed() < SELF_WRITE_DEBOUNCE)
+    }
+
+    fn read_manifest_entry(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<views::manifest::ManifestEntrySnapshot>, String> {
+        let Some(path) = self.manifest_path() else {
+            return Ok(None);
+        };
+        crate::manifest_file::read_entry(&path, name)
+    }
+
+    fn write_manifest_entry(
+        &self,
+        snapshot: &views::manifest::ManifestEntrySnapshot,
+    ) -> std::result::Result<(), String> {
+        let path = self.manifest_path().ok_or_else(missing_manifest)?;
+        self.mark_self_write();
+        crate::manifest_file::write_entry(&path, snapshot)
+    }
+
+    fn write_manifest_remove(&self, name: &str) -> std::result::Result<(), String> {
+        let path = self.manifest_path().ok_or_else(missing_manifest)?;
+        self.mark_self_write();
+        crate::manifest_file::remove_entry(&path, name)
+    }
+
+    fn write_manifest_replace_packages(
+        &self,
+        entries: &[(String, String)],
+    ) -> std::result::Result<(), String> {
+        let path = self.manifest_path().ok_or_else(missing_manifest)?;
+        self.mark_self_write();
+        crate::manifest_file::replace_packages(&path, entries)
+    }
+
     pub fn load_manifest_diff(&mut self, cx: &mut Context<Self>) {
-        use crate::adapters::soar::ManifestLoadError;
+        use crate::manifest_file::ManifestLoadError;
         use views::manifest::ManifestStatus;
 
-        self.manifest_state.path = Some(self.adapter.manifest_path());
+        let path = self.manifest_path();
+        self.manifest_state.path = path.clone();
         self.manifest_state.status = ManifestStatus::Loading;
 
-        let adapter = self.adapter.clone();
-        let mode = self.current_mode;
-        // Always compute the undeclared set so the user can see it. Whether
-        // we act on it during apply is governed by the Prune toggle later.
-        let compute_prune = true;
+        let Some(adapter) = self.adapter.clone() else {
+            self.manifest_state.status = ManifestStatus::Failed("No package manager".into());
+            return;
+        };
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = crate::tokio_spawn(async move {
-                    adapter.manifest_diff(mode, compute_prune).await
+                    match path.as_deref() {
+                        Some(path) => crate::manifest_file::check_readable(path)?,
+                        None => return Err(ManifestLoadError::FileMissing),
+                    }
+
+                    adapter
+                        .declarative_diff()
+                        .await
+                        .map_err(|e| ManifestLoadError::Other(e.to_string()))
                 })
                 .await;
 
@@ -608,7 +774,7 @@ impl App {
                             Err(e) => ManifestStatus::Failed(format!("{e}")),
                         };
                         if let Some(name) = app.manifest_state.selected_entry.clone() {
-                            match app.adapter.read_manifest_entry(&name) {
+                            match app.read_manifest_entry(&name) {
                                 Ok(Some(snap)) => {
                                     app.manifest_state.selected_snapshot = Some(snap);
                                 }
@@ -647,10 +813,12 @@ impl App {
     }
 
     pub fn apply_manifest(&mut self, prune: bool, cx: &mut Context<Self>) {
-        use crate::adapters::soar::ManifestLoadError;
+        use crate::manifest_file::ManifestLoadError;
         use views::manifest::ManifestStatus;
 
-        let adapter_id = self.adapter.info().id.clone();
+        let Some(adapter_id) = self.adapter.as_ref().map(|a| a.info().id.clone()) else {
+            return;
+        };
         let seed_keys: Vec<String> = match &self.manifest_state.status {
             ManifestStatus::Loaded(diff) => {
                 let mut keys: Vec<String> = diff
@@ -680,13 +848,18 @@ impl App {
         self.manifest_state.apply_error = None;
         self.manifest_state.last_report = None;
 
-        let adapter = self.adapter.clone();
-        let mode = self.current_mode;
+        let Some(adapter) = self.adapter.clone() else {
+            return;
+        };
+        let progress = self.progress_sender.clone();
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = crate::tokio_spawn(async move {
-                    adapter.apply_manifest(mode, prune, false).await
+                    adapter
+                        .declarative_apply(prune, Some(progress))
+                        .await
+                        .map_err(|e| ManifestLoadError::Other(e.to_string()))
                 })
                 .await;
 
@@ -743,27 +916,20 @@ impl App {
     }
 
     pub fn open_manifest_add(&mut self, cx: &mut Context<Self>) {
-        use views::manifest::{
-            build_manifest_edit_modal, ManifestEditKind, ManifestEntrySnapshot,
-        };
+        use views::manifest::{ManifestEditKind, ManifestEntrySnapshot, build_manifest_edit_modal};
         let snap = ManifestEntrySnapshot {
             version: "*".to_string(),
             ..Default::default()
         };
-        self.manifest_state.edit = Some(build_manifest_edit_modal(
-            ManifestEditKind::Add,
-            &snap,
-            cx,
-        ));
+        self.manifest_state.edit =
+            Some(build_manifest_edit_modal(ManifestEditKind::Add, &snap, cx));
         self.manifest_state.pending_edit_focus = true;
         cx.notify();
     }
 
     pub fn open_manifest_edit(&mut self, name: String, cx: &mut Context<Self>) {
-        use views::manifest::{
-            build_manifest_edit_modal, ManifestEditKind, ManifestEntrySnapshot,
-        };
-        let snap = match self.adapter.read_manifest_entry(&name) {
+        use views::manifest::{ManifestEditKind, ManifestEntrySnapshot, build_manifest_edit_modal};
+        let snap = match self.read_manifest_entry(&name) {
             Ok(Some(s)) => s,
             Ok(None) => ManifestEntrySnapshot {
                 name: name.clone(),
@@ -811,7 +977,12 @@ impl App {
             url: edit.url_input.read(cx).content().trim().to_string(),
             github: edit.github_input.read(cx).content().trim().to_string(),
             gitlab: edit.gitlab_input.read(cx).content().trim().to_string(),
-            asset_pattern: edit.asset_pattern_input.read(cx).content().trim().to_string(),
+            asset_pattern: edit
+                .asset_pattern_input
+                .read(cx)
+                .content()
+                .trim()
+                .to_string(),
             tag_pattern: edit.tag_pattern_input.read(cx).content().trim().to_string(),
             include_prerelease: edit.include_prerelease,
             build_commands: build_commands_joined,
@@ -841,7 +1012,7 @@ impl App {
             if original != &snap.name {
                 // The name was changed on an existing entry. Remove the old key so
                 // we do not leave both.
-                if let Err(e) = self.adapter.write_manifest_remove(original) {
+                if let Err(e) = self.write_manifest_remove(original) {
                     self.manifest_state.save_error = Some(e.clone());
                     self.add_toast(ToastLevel::Error, format!("Manifest save failed: {e}"));
                     return;
@@ -855,7 +1026,7 @@ impl App {
             snap.version = String::new();
         }
 
-        match self.adapter.write_manifest_entry(&snap) {
+        match self.write_manifest_entry(&snap) {
             Ok(()) => {
                 self.manifest_state.save_error = None;
                 self.load_manifest_diff(cx);
@@ -868,7 +1039,7 @@ impl App {
     }
 
     pub fn remove_manifest_entry(&mut self, name: String, cx: &mut Context<Self>) {
-        match self.adapter.write_manifest_remove(&name) {
+        match self.write_manifest_remove(&name) {
             Ok(()) => {
                 self.manifest_state.save_error = None;
                 self.add_toast(ToastLevel::Info, format!("Removed {name} from manifest"));
@@ -897,7 +1068,7 @@ impl App {
             return;
         }
         let count = entries.len();
-        match self.adapter.write_manifest_replace_packages(&entries) {
+        match self.write_manifest_replace_packages(&entries) {
             Ok(()) => {
                 self.manifest_state.save_error = None;
                 self.add_toast(
@@ -914,7 +1085,7 @@ impl App {
     }
 
     pub fn select_manifest_entry(&mut self, name: String, cx: &mut Context<Self>) {
-        let snap = match self.adapter.read_manifest_entry(&name) {
+        let snap = match self.read_manifest_entry(&name) {
             Ok(s) => s,
             Err(_) => None,
         };
@@ -930,7 +1101,7 @@ impl App {
     }
 
     pub fn create_empty_manifest(&mut self, cx: &mut Context<Self>) {
-        match self.adapter.write_manifest_replace_packages(&[]) {
+        match self.write_manifest_replace_packages(&[]) {
             Ok(()) => {
                 self.manifest_state.save_error = None;
                 self.add_toast(ToastLevel::Success, "Created an empty manifest".into());
@@ -1482,9 +1653,11 @@ impl App {
         self.adapter_view.registry_loading = true;
         self.adapter_view.registry_error = None;
 
+        let registry_url = self.aeris_config.registry_url.clone();
+
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = crate::core::registry::fetch_registry(None);
+                let result = crate::core::registry::fetch_registry(registry_url.as_deref());
 
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
@@ -1497,6 +1670,54 @@ impl App {
                             }
                         }
                         app.adapter_view.registry_loading = false;
+                        cx.notify();
+                    })
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Fetch an adapter's manifest from the registry and start using it.
+    ///
+    /// The manifest is kept whether or not the manager it describes is
+    /// installed, so installing the manager later is all it takes.
+    pub fn install_plugin(&mut self, entry: PluginEntry, cx: &mut Context<Self>) {
+        let id = entry.id.clone();
+        let name = entry.name.clone();
+        self.adapter_view.installing_plugin = Some(id.clone());
+
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let fetched = crate::core::registry::download_plugin(&entry).and_then(|path| {
+                    let manifest = crate::adapters::command::manifest::load(&path)?;
+                    Ok((path, manifest))
+                });
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.adapter_view.installing_plugin = None;
+
+                        match fetched {
+                            Ok((path, manifest)) => {
+                                match CommandAdapter::new(manifest, Some(path)) {
+                                    Ok(adapter) => {
+                                        register_new(&mut app.adapter_manager, Arc::new(adapter));
+                                        app.add_toast(ToastLevel::Success, format!("Added {name}"));
+                                    }
+                                    // The manifest is sound but the manager it
+                                    // describes is missing or too old. Keeping
+                                    // it means installing that is enough.
+                                    Err(e) => app.add_toast(
+                                        ToastLevel::Error,
+                                        format!("Kept the manifest for {name}, but {e}"),
+                                    ),
+                                }
+                            }
+                            Err(e) => app
+                                .add_toast(ToastLevel::Error, format!("Could not add {name}: {e}")),
+                        }
+
                         cx.notify();
                     })
                 });
@@ -1524,6 +1745,13 @@ impl App {
             _ => "dashboard".to_string(),
         });
         self.aeris_config.notifications = Some(self.settings_state.notifications);
+        // An empty URL falls back to the default, so it is stored as nothing
+        // rather than as an empty string.
+        self.aeris_config.registry_url = if self.settings_state.registry_url.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings_state.registry_url.trim().to_string())
+        };
 
         self.selected_theme = self.settings_state.selected_theme;
 
@@ -1540,13 +1768,50 @@ impl App {
         cx.notify();
     }
 
+    /// Fetch the registry from the URL currently in the box and report back
+    /// how many adapters it offers, or why it could not be read. The value is
+    /// tested as-is rather than waiting for a save, and a blank URL means the
+    /// default, so a source can be tried before it is committed.
+    pub fn test_registry(&mut self, cx: &mut Context<Self>) {
+        self.settings_state.registry_testing = true;
+        self.settings_state.registry_test_error = None;
+        self.settings_state.registry_test_count = None;
+
+        let url = self.settings_state.registry_url.trim().to_string();
+        let url = if url.is_empty() { None } else { Some(url) };
+
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = crate::core::registry::fetch_registry(url.as_deref());
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.settings_state.registry_testing = false;
+                        match result {
+                            Ok(registry) => {
+                                app.settings_state.registry_test_count =
+                                    Some(registry.plugins.len());
+                            }
+                            Err(e) => {
+                                app.settings_state.registry_test_error = Some(e);
+                            }
+                        }
+                        cx.notify();
+                    })
+                });
+            },
+        )
+        .detach();
+    }
+
     pub fn save_adapter_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_state.saving = true;
         self.settings_state.adapter_save_error = None;
         self.settings_state.adapter_save_success = false;
 
         let config = self.settings_state.adapter_config.clone();
-        let adapter = self.adapter.clone();
+        let Some(adapter) = self.adapter.clone() else {
+            return;
+        };
         let mode = self.current_mode;
 
         cx.spawn(
@@ -1584,20 +1849,27 @@ impl App {
 
     pub fn toggle_adapter_config(&mut self, key: &str, cx: &mut Context<Self>) {
         use crate::core::config::ConfigValue;
-        let current = self
-            .settings_state
-            .adapter_config
-            .values
-            .get(key)
-            .and_then(|v| match v {
-                ConfigValue::Bool(b) => Some(*b),
-                _ => None,
-            })
+        let as_bool = |v: Option<&ConfigValue>| match v {
+            Some(ConfigValue::Bool(b)) => Some(*b),
+            _ => None,
+        };
+        // Flip relative to the value in effect — an override, or else what the
+        // manager currently has — rather than the empty edit state.
+        let effective = as_bool(self.settings_state.adapter_config.values.get(key))
+            .or_else(|| as_bool(self.settings_state.current_config.values.get(key)))
             .unwrap_or(false);
-        self.settings_state
-            .adapter_config
-            .values
-            .insert(key.to_string(), ConfigValue::Bool(!current));
+        let next = !effective;
+
+        // Landing back on what the manager already has drops the override, so a
+        // no-op is not stored as a change.
+        if as_bool(self.settings_state.current_config.values.get(key)) == Some(next) {
+            self.settings_state.adapter_config.values.remove(key);
+        } else {
+            self.settings_state
+                .adapter_config
+                .values
+                .insert(key.to_string(), ConfigValue::Bool(next));
+        }
         self.settings_state.adapter_dirty =
             self.settings_state.adapter_config != self.settings_state.adapter_config_original;
         cx.notify();
@@ -1714,11 +1986,16 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         use crate::core::config::ConfigValue;
-        let initial = self
+        // A value that is actually set — an override typed this session or
+        // read from the manager's config file — fills the input so it can be
+        // edited; only a pure default (nothing concrete) starts empty.
+        let value = self
             .settings_state
             .adapter_config
             .values
             .get(key)
+            .or_else(|| self.settings_state.current_config.values.get(key));
+        let initial = value
             .map(|v| match v {
                 ConfigValue::String(s) => s.clone(),
                 ConfigValue::Integer(n) => n.to_string(),
@@ -1733,9 +2010,30 @@ impl App {
             ti
         });
         self.settings_state.edit = Some(crate::views::settings::SettingsEdit {
+            scope: crate::views::settings::SettingsEditScope::Adapter,
             key: key.to_string(),
             label: label.to_string(),
             field_type,
+            input,
+        });
+        self.pending_settings_edit_focus = true;
+        cx.notify();
+    }
+
+    /// Open the shared settings editor for the registry URL, an Aeris-level
+    /// value rather than a field on the active adapter.
+    pub fn open_registry_url_edit(&mut self, cx: &mut Context<Self>) {
+        let initial = self.settings_state.registry_url.clone();
+        let input = cx.new(|cx| {
+            let mut ti = crate::components::TextInput::new(cx, "URL or local path");
+            ti.set_content(initial, cx);
+            ti
+        });
+        self.settings_state.edit = Some(crate::views::settings::SettingsEdit {
+            scope: crate::views::settings::SettingsEditScope::RegistryUrl,
+            key: "registry_url".to_string(),
+            label: "Registry URL".to_string(),
+            field_type: crate::core::config::ConfigFieldType::Text,
             input,
         });
         self.pending_settings_edit_focus = true;
@@ -1749,10 +2047,26 @@ impl App {
 
     pub fn apply_settings_edit(&mut self, raw: String, cx: &mut Context<Self>) {
         use crate::core::config::{ConfigFieldType, ConfigValue};
+        use crate::views::settings::SettingsEditScope;
         let edit = match self.settings_state.edit.take() {
             Some(e) => e,
             None => return,
         };
+
+        // The registry URL is an Aeris-level string rather than an adapter
+        // field, so it is written back to the Aeris settings rather than to
+        // the adapter config. An empty value means "use the default".
+        if edit.scope == SettingsEditScope::RegistryUrl {
+            let trimmed = raw.trim().to_string();
+            let changed = self.settings_state.registry_url != trimmed;
+            self.settings_state.registry_url = trimmed;
+            if changed {
+                self.settings_state.aeris_dirty = true;
+            }
+            cx.notify();
+            return;
+        }
+
         let new_value = match edit.field_type {
             ConfigFieldType::Number => match raw.trim().parse::<i64>() {
                 Ok(n) => ConfigValue::Integer(n),
@@ -1765,10 +2079,24 @@ impl App {
             ConfigFieldType::Toggle => return,
             _ => ConfigValue::String(raw),
         };
-        self.settings_state
-            .adapter_config
+        // An empty value, or one that matches what the manager already has on
+        // disk, means "no override": the key is dropped rather than stored, so
+        // clearing the box or saving an unchanged value leaves the field as it is.
+        let is_empty_text = matches!(&new_value, ConfigValue::String(s) if s.trim().is_empty());
+        let matches_current = self
+            .settings_state
+            .current_config
             .values
-            .insert(edit.key, new_value);
+            .get(&edit.key)
+            .is_some_and(|current| current == &new_value);
+        if is_empty_text || matches_current {
+            self.settings_state.adapter_config.values.remove(&edit.key);
+        } else {
+            self.settings_state
+                .adapter_config
+                .values
+                .insert(edit.key, new_value);
+        }
         self.settings_state.adapter_dirty =
             self.settings_state.adapter_config != self.settings_state.adapter_config_original;
         cx.notify();
@@ -1810,7 +2138,7 @@ impl App {
             return;
         }
 
-        let bin_path = match soar_active_bin_path() {
+        let bin_path = match active_bin_path(&self.paths) {
             Some(p) => p,
             None => {
                 self.add_toast(
@@ -1917,10 +2245,15 @@ impl App {
             Some(a) => a,
             None => return,
         };
+        // Saying so beats an empty space, which reads as something that
+        // failed rather than something never offered.
         if !adapter.capabilities().has_package_detail {
             self.browse_state.selected_detail = None;
             self.browse_state.detail_loading = false;
-            self.browse_state.detail_error = None;
+            self.browse_state.detail_error = Some(format!(
+                "{} does not report more than this",
+                adapter.info().name
+            ));
             return;
         }
 
@@ -1931,8 +2264,11 @@ impl App {
         self.browse_state.detail_error = None;
 
         let pkg_id = pkg.id.clone();
+        log::debug!("loading details for {pkg_id}");
+
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let asked_for = pkg_id.clone();
                 let result =
                     crate::tokio_spawn(async move { adapter.package_detail(&pkg_id).await })
                         .await
@@ -1940,7 +2276,11 @@ impl App {
                             Err(crate::core::adapter::AdapterError::Other(format!("{e}")))
                         });
 
-                let _ = cx.update(|cx| {
+                if let Err(ref e) = result {
+                    log::warn!("could not load details for {asked_for}: {e}");
+                }
+
+                let updated = cx.update(|cx| {
                     this.update(cx, |app, cx| {
                         // Discard result if a newer request superseded this one
                         if request_id != app.browse_state.detail_request_id {
@@ -1949,6 +2289,11 @@ impl App {
                         app.browse_state.detail_loading = false;
                         match result {
                             Ok(detail) => {
+                                log::debug!(
+                                    "showing details for {asked_for}: type={:?} source={:?}",
+                                    detail.pkg_type,
+                                    detail.source
+                                );
                                 app.browse_state.selected_detail = Some(detail);
                             }
                             Err(e) => {
@@ -1958,6 +2303,10 @@ impl App {
                         cx.notify();
                     })
                 });
+
+                if let Err(e) = updated {
+                    log::warn!("could not show details for {asked_for}: {e}");
+                }
             },
         )
         .detach();
@@ -2035,11 +2384,10 @@ impl App {
 
     fn drain_progress(&mut self, cx: &mut Context<Self>) {
         use crate::core::adapter::{ProgressEvent, progress_key};
-        use soar_events::{InstallStage, RemoveStage, SoarEvent, VerifyStage};
 
         let mut had_events = false;
 
-        // Drain ProgressEvent channel (from WASM adapters)
+        // Drain the events adapters report as they work
         while let Ok(event) = self.progress_receiver.try_recv() {
             had_events = true;
             match event {
@@ -2065,7 +2413,7 @@ impl App {
                     ..
                 } => {
                     let key = progress_key(&adapter_id, &package_id);
-                    self.record_progress(key, OperationStatus::Installing(phase));
+                    self.record_progress(key, OperationStatus::Installing(readable(&phase)));
                 }
                 ProgressEvent::Completed {
                     adapter_id,
@@ -2073,11 +2421,6 @@ impl App {
                 } => {
                     let key = progress_key(&adapter_id, &package_id);
                     self.record_progress(key, OperationStatus::Completed);
-                    for pkg in &mut self.browse_state.search_results {
-                        if pkg.id == package_id && pkg.adapter_id == adapter_id {
-                            pkg.installed = true;
-                        }
-                    }
                 }
                 ProgressEvent::Failed {
                     adapter_id,
@@ -2105,108 +2448,6 @@ impl App {
             }
         }
 
-        // Drain SoarEvent channel (from soar adapter)
-        while let Ok(event) = self.event_receiver.try_recv() {
-            had_events = true;
-            match event {
-                SoarEvent::DownloadStarting { pkg_id, total, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(
-                            key,
-                            OperationStatus::Downloading { current: 0, total },
-                        );
-                    }
-                }
-                SoarEvent::DownloadProgress {
-                    pkg_id,
-                    current,
-                    total,
-                    ..
-                }
-                | SoarEvent::DownloadResuming {
-                    pkg_id,
-                    current,
-                    total,
-                    ..
-                } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(
-                            key,
-                            OperationStatus::Downloading { current, total },
-                        );
-                    }
-                }
-                SoarEvent::DownloadComplete { pkg_id, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(
-                            key,
-                            OperationStatus::Installing("Download complete".into()),
-                        );
-                    }
-                }
-                SoarEvent::Verifying { pkg_id, stage, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        let label = match stage {
-                            VerifyStage::Checksum => "Verifying checksum",
-                            VerifyStage::Signature => "Verifying signature",
-                            VerifyStage::Passed => "Verification passed",
-                            VerifyStage::Failed(_) => "Verification failed",
-                        };
-                        self.record_progress(key, OperationStatus::Verifying(label.into()));
-                    }
-                }
-                SoarEvent::Installing { pkg_id, stage, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        let label = match &stage {
-                            InstallStage::Extracting => "Extracting".to_string(),
-                            InstallStage::ExtractingNested => "Extracting nested".to_string(),
-                            InstallStage::LinkingBinaries => "Linking binaries".to_string(),
-                            InstallStage::DesktopIntegration => "Desktop integration".to_string(),
-                            InstallStage::SetupPortable => "Setting up portable".to_string(),
-                            InstallStage::RecordingDatabase => "Recording to database".to_string(),
-                            InstallStage::RunningHook(h) => format!("Running hook: {h}"),
-                            InstallStage::Complete => "Complete".to_string(),
-                        };
-                        self.record_progress(key, OperationStatus::Installing(label));
-                    }
-                }
-                SoarEvent::Removing { pkg_id, stage, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        let label = match &stage {
-                            RemoveStage::RunningHook(h) => format!("Running hook: {h}"),
-                            RemoveStage::UnlinkingBinaries => "Unlinking binaries".to_string(),
-                            RemoveStage::UnlinkingDesktop => "Unlinking desktop files".to_string(),
-                            RemoveStage::UnlinkingIcons => "Unlinking icons".to_string(),
-                            RemoveStage::RemovingDirectory => "Removing directory".to_string(),
-                            RemoveStage::CleaningDatabase => "Cleaning database".to_string(),
-                            RemoveStage::Complete { .. } => "Complete".to_string(),
-                        };
-                        self.record_progress(key, OperationStatus::Removing(label));
-                    }
-                }
-                SoarEvent::OperationComplete { pkg_id, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(key, OperationStatus::Completed);
-                    }
-                }
-                SoarEvent::OperationFailed { pkg_id, error, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(key, OperationStatus::Failed(error));
-                    }
-                }
-                SoarEvent::DownloadRetry { pkg_id, .. }
-                | SoarEvent::DownloadAborted { pkg_id, .. } => {
-                    if let Some(key) = self.soar_progress_key(&pkg_id) {
-                        self.record_progress(
-                            key,
-                            OperationStatus::Failed("Download failed".into()),
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-
         if had_events {
             cx.notify();
         }
@@ -2224,7 +2465,7 @@ impl App {
             }
         }
 
-        if saw_event && !self.adapter.is_recent_self_write() {
+        if saw_event && !self.is_recent_self_write() {
             self.manifest_reload_due =
                 Some(Instant::now() + Duration::from_millis(MANIFEST_RELOAD_COALESCE_MS));
         }
@@ -2687,24 +2928,20 @@ impl Render for App {
                     }
                     body = body.child(list);
                     body = body.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .id("settings-edit-select-cancel")
-                                    .px(px(styles::spacing::LG))
-                                    .py(px(styles::spacing::XS))
-                                    .rounded(px(styles::radius::MD))
-                                    .bg(surface)
-                                    .border_1()
-                                    .border_color(border)
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(hover))
-                                    .on_click(cancel_select)
-                                    .child("Cancel"),
-                            ),
+                        div().flex().flex_row().justify_end().child(
+                            div()
+                                .id("settings-edit-select-cancel")
+                                .px(px(styles::spacing::LG))
+                                .py(px(styles::spacing::XS))
+                                .rounded(px(styles::radius::MD))
+                                .bg(surface)
+                                .border_1()
+                                .border_color(border)
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(hover))
+                                .on_click(cancel_select)
+                                .child("Cancel"),
+                        ),
                     );
                 }
                 _ => {
@@ -2847,11 +3084,7 @@ impl Render for App {
 }
 
 impl App {
-    fn render_manifest_edit_modal(
-        &mut self,
-        theme: &theme::Theme,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    fn render_manifest_edit_modal(&mut self, theme: &theme::Theme, cx: &mut Context<Self>) -> Div {
         use views::manifest::ManifestEditKind;
         let edit = self
             .manifest_state
@@ -2951,79 +3184,83 @@ impl App {
         };
 
         let section = |title: &str, rows: Vec<Div>| -> Div {
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .gap(px(styles::spacing::SM))
-                .child(
-                    div()
-                        .text_size(px(styles::font_size::CAPTION))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(text_muted)
-                        .child(title.to_uppercase()),
-                );
+            let mut col = div().flex().flex_col().gap(px(styles::spacing::SM)).child(
+                div()
+                    .text_size(px(styles::font_size::CAPTION))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(text_muted)
+                    .child(title.to_uppercase()),
+            );
             for row in rows {
                 col = col.child(row);
             }
             col
         };
 
-        let toggle_row = |label: &str,
-                          description: &str,
-                          on: bool,
-                          id: &str,
-                          listener: Box<
-            dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
-        >|
-         -> Div {
-            let track_on = primary;
-            let track_off = border;
-            let track = if on { track_on } else { track_off };
-            let thumb = if on {
-                div().ml_auto().w(px(16.0)).h(px(16.0)).rounded_full().bg(gpui::white())
-            } else {
-                div().w(px(16.0)).h(px(16.0)).rounded_full().bg(gpui::white())
-            };
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(styles::spacing::MD))
-                .child(
+        let toggle_row =
+            |label: &str,
+             description: &str,
+             on: bool,
+             id: &str,
+             listener: Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>|
+             -> Div {
+                let track_on = primary;
+                let track_off = border;
+                let track = if on { track_on } else { track_off };
+                let thumb = if on {
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(styles::spacing::XXXS))
-                        .child(
-                            div()
-                                .text_size(px(styles::font_size::BODY))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(label.to_string()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(styles::font_size::CAPTION))
-                                .text_color(text_muted)
-                                .child(description.to_string()),
-                        ),
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(id.to_string()))
-                        .w(px(34.0))
-                        .h(px(20.0))
-                        .p(px(2.0))
+                        .ml_auto()
+                        .w(px(16.0))
+                        .h(px(16.0))
                         .rounded_full()
-                        .bg(track)
-                        .cursor_pointer()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .on_click(listener)
-                        .child(thumb),
-                )
-        };
+                        .bg(gpui::white())
+                } else {
+                    div()
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded_full()
+                        .bg(gpui::white())
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(styles::spacing::MD))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(styles::spacing::XXXS))
+                            .child(
+                                div()
+                                    .text_size(px(styles::font_size::BODY))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(label.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(styles::font_size::CAPTION))
+                                    .text_color(text_muted)
+                                    .child(description.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(id.to_string()))
+                            .w(px(34.0))
+                            .h(px(20.0))
+                            .p(px(2.0))
+                            .rounded_full()
+                            .bg(track)
+                            .cursor_pointer()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .on_click(listener)
+                            .child(thumb),
+                    )
+            };
 
         let labeled_row = |label: &str,
                            hint: Option<&str>,
@@ -3117,7 +3354,9 @@ impl App {
             vec![
                 labeled_row(
                     "Commands",
-                    Some("Shell commands separated by semicolons. Env: $INSTALL_DIR, $PKG_NAME, $PKG_VERSION, $NPROC."),
+                    Some(
+                        "Shell commands separated by semicolons. Env: $INSTALL_DIR, $PKG_NAME, $PKG_VERSION, $NPROC.",
+                    ),
                     build_commands_input,
                     true,
                 ),
@@ -3410,6 +3649,16 @@ impl App {
             );
         }
 
+        // Offered only where the manager says it can act system wide, which
+        // needs privileges nothing here knows how to ask for otherwise.
+        if !self
+            .adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.capabilities().supports_system_packages)
+        {
+            return header;
+        }
+
         let toggle_mode = cx.listener(|app, _: &ClickEvent, _window, cx| {
             app.toggle_mode(cx);
         });
@@ -3502,6 +3751,28 @@ impl App {
         }
     }
 
+    /// Record what a package's state became, everywhere browse shows it.
+    ///
+    /// The operation that ran is what knows this. A completion event only
+    /// says the work finished, not which way it left the package.
+    fn mark_installed(&mut self, adapter_id: &str, package_id: &str, installed: bool) {
+        for package in &mut self.browse_state.search_results {
+            if package.id == package_id && package.adapter_id == adapter_id {
+                package.installed = installed;
+            }
+        }
+
+        if let Some(selected) = &mut self.browse_state.selected_package
+            && selected.id == package_id
+            && selected.adapter_id == adapter_id
+        {
+            selected.installed = installed;
+        }
+
+        let key = crate::core::adapter::progress_key(adapter_id, package_id);
+        self.browse_state.package_progress.remove(&key);
+    }
+
     pub(crate) fn install_package(
         &mut self,
         pkg: crate::core::package::Package,
@@ -3510,6 +3781,7 @@ impl App {
     ) {
         let pkg_id = pkg.id.clone();
         let pkg_name = pkg.name.clone();
+        let adapter_id = pkg.adapter_id.clone();
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
         self.browse_state.installing = Some(pkg_id.clone());
         self.browse_state
@@ -3531,12 +3803,7 @@ impl App {
                             app.browse_state.installing = None;
                             match result {
                                 Ok(Ok(_)) => {
-                                    // Mark as installed in search results
-                                    for p in &mut app.browse_state.search_results {
-                                        if p.id == pkg_id {
-                                            p.installed = true;
-                                        }
-                                    }
+                                    app.mark_installed(&adapter_id, &pkg_id, true);
                                     app.browse_state.package_progress.remove(&progress_key);
                                     app.add_toast(
                                         ToastLevel::Success,
@@ -3591,6 +3858,8 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let pkg_name = pkg.name.clone();
+        let pkg_id = pkg.id.clone();
+        let adapter_id = pkg.adapter_id.clone();
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
         self.installed_state.removing = Some(unique_key);
         self.installed_state
@@ -3613,6 +3882,7 @@ impl App {
                             app.installed_state.package_progress.remove(&progress_key);
                             match result {
                                 Ok(Ok(_)) => {
+                                    app.mark_installed(&adapter_id, &pkg_id, false);
                                     app.add_toast(
                                         ToastLevel::Success,
                                         format!("Removed {pkg_name}"),
@@ -3913,5 +4183,48 @@ impl App {
             },
         )
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not glob importing the parent: it pulls in gpui's prelude,
+    // which shadows the test attribute.
+    use super::readable;
+
+    #[test]
+    fn work_that_ended_is_not_work_in_flight() {
+        use super::OperationStatus;
+
+        assert!(OperationStatus::Completed.is_finished());
+        assert!(OperationStatus::Failed("nope".into()).is_finished());
+        assert!(!OperationStatus::Starting.is_finished());
+        assert!(
+            !OperationStatus::Downloading {
+                current: 1,
+                total: 2
+            }
+            .is_finished()
+        );
+        assert!(!OperationStatus::Installing("extracting".into()).is_finished());
+    }
+
+    #[test]
+    fn a_status_says_less_where_there_is_less_room() {
+        use super::OperationStatus;
+
+        let downloading = OperationStatus::Downloading {
+            current: 82_100_000,
+            total: 341_300_000,
+        };
+        assert_eq!(downloading.short_label(), "Downloading 24%");
+        assert!(downloading.label().contains("MB"));
+    }
+
+    #[test]
+    fn a_stage_is_shown_the_way_a_person_would_write_it() {
+        assert_eq!(readable("linking_binaries"), "Linking binaries");
+        assert_eq!(readable("extracting"), "Extracting");
+        assert_eq!(readable(""), "");
     }
 }
