@@ -31,6 +31,10 @@ pub struct PackageDetail {
     pub source: Option<String>,
     pub build_date: Option<String>,
     pub download_url: Option<String>,
+    /// Whatever else the manager reports, labelled as it asked. Aeris shows
+    /// these without knowing what any of them mean.
+    #[serde(default)]
+    pub extra: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +52,11 @@ pub struct InstalledPackage {
 impl InstalledPackage {
     /// Unique key for selection/tracking, distinguishing different installs of the same package.
     pub fn unique_key(&self) -> String {
-        format!("{}@{}", self.package.id, self.package.version)
+        format!(
+            "{}@{}",
+            super::adapter::package_key(&self.package.adapter_id, &self.package.id),
+            self.package.version
+        )
     }
 }
 

@@ -420,12 +420,22 @@ impl Adapter for CommandAdapter {
             .to_package(record, fields)
             .ok_or_else(|| AdapterError::PackageNotFound(package_id.to_string()))?;
 
+        // Whatever else the manifest asked to be shown, in the order it
+        // asked. Nothing here knows what any of them mean.
+        let extra = self
+            .op(OP_INFO)?
+            .extra
+            .iter()
+            .filter_map(|extra| Some((extra.label.clone(), output::value(record, &extra.field)?)))
+            .collect();
+
         Ok(PackageDetail {
             package,
             pkg_type: output::text(record, fields, "pkg_type"),
             source: output::text(record, fields, "source"),
             build_date: output::text(record, fields, "build_date"),
             download_url: output::text(record, fields, "download_url"),
+            extra,
         })
     }
 
@@ -881,7 +891,6 @@ fn changes(record: &Value, key: &str, removing: bool) -> Vec<ManifestEntry> {
                     let version = text(item, "version");
                     Some(ManifestEntry {
                         name: text(item, "name")?,
-                        pkg_id: text(item, "pkg_id"),
                         current_version: text(item, "current_version"),
                         // A package on its way out has no version to move to.
                         new_version: (!removing).then_some(version).flatten(),
@@ -1118,9 +1127,9 @@ impl<'a> Reporter<'a> {
 
                 Some(Value::Object(record))
             }
-            // A document is only whole once the run ends, so it says nothing
-            // while the work is still going.
-            Format::Json => None,
+            // Neither is whole until the run ends, so they say nothing while
+            // the work is still going.
+            Format::Json | Format::KeyValue => None,
         }
     }
 
