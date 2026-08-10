@@ -238,10 +238,13 @@ impl App {
         let mut header = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .gap(px(styles::spacing::SM))
             .items_center()
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_size(px(styles::font_size::HEADING))
                     .child(pkg.package.name.clone()),
             );
@@ -249,6 +252,7 @@ impl App {
         if !pkg.package.version.is_empty() {
             header = header.child(
                 div()
+                    .flex_shrink_0()
                     .px(px(styles::spacing::XS))
                     .py(px(styles::spacing::XXXS))
                     .rounded(px(styles::radius::SM))
@@ -280,6 +284,7 @@ impl App {
         let mut info_row = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .gap(px(styles::spacing::MD))
             .items_center();
 
@@ -298,6 +303,8 @@ impl App {
         if let Some(ref path) = pkg.install_path {
             info_row = info_row.child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_size(px(styles::font_size::CAPTION))
                     .text_color(text_muted)
                     .child(path.clone()),
@@ -327,9 +334,11 @@ impl App {
             );
         }
 
-        // Left column
+        // Left column. Like the browse row, this has to be allowed to shrink
+        // or a long name or install path pushes the buttons off the end.
         let mut left = div()
             .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::XXS))
@@ -356,13 +365,13 @@ impl App {
             .gap(px(styles::spacing::XS))
             .items_center();
 
-        let can_run = self
+        let caps = self
             .adapter_manager
             .get_adapter(&pkg.package.adapter_id)
-            .map(|a| a.capabilities().can_run)
-            .unwrap_or(false);
+            .map(|a| *a.capabilities())
+            .unwrap_or_default();
 
-        if can_run {
+        if caps.can_run {
             let run_installed = pkg.clone();
             let run_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
@@ -467,8 +476,9 @@ impl App {
             }
         }
 
-        // Remove button
-        if is_removing {
+        // Remove is only offered when the manager has a command for it, since
+        // otherwise pressing it could only ever fail.
+        if caps.can_remove && is_removing {
             let label = pkg_status
                 .map(|s| s.label())
                 .unwrap_or_else(|| "Removing...".into());
@@ -482,7 +492,7 @@ impl App {
                     .text_size(px(styles::font_size::SMALL))
                     .child(label),
             );
-        } else {
+        } else if caps.can_remove {
             let remove_pkg = pkg.package.clone();
             let remove_unique_key = unique_key.clone();
             let remove_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
@@ -565,6 +575,6 @@ impl App {
             .items_center()
             .child(checkbox)
             .child(left)
-            .child(buttons)
+            .child(div().flex_shrink_0().child(buttons))
     }
 }

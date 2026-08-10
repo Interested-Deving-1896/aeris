@@ -324,10 +324,13 @@ impl App {
         let mut header = div()
             .flex()
             .flex_row()
+            .min_w_0()
             .gap(px(styles::spacing::SM))
             .items_center()
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_size(px(styles::font_size::HEADING))
                     .child(pkg.name.clone()),
             );
@@ -335,6 +338,7 @@ impl App {
         if !pkg.version.is_empty() {
             header = header.child(
                 div()
+                    .flex_shrink_0()
                     .px(px(styles::spacing::XS))
                     .py(px(styles::spacing::XXXS))
                     .rounded(px(styles::radius::SM))
@@ -349,6 +353,8 @@ impl App {
         header = header.child(self.adapter_badge(&pkg.adapter_id, theme));
 
         let description = div()
+            .w_full()
+            .truncate()
             .text_size(px(styles::font_size::SMALL))
             .text_color(text_muted)
             .child(
@@ -380,6 +386,11 @@ impl App {
                     .child(license.clone()),
             );
         }
+
+        let can_install = self
+            .adapter_manager
+            .get_adapter(&pkg.adapter_id)
+            .is_some_and(|a| a.capabilities().can_install);
 
         let install_status: AnyElement = if pkg.installed && pkg.update_available {
             div()
@@ -422,6 +433,10 @@ impl App {
                 .text_color(primary)
                 .child(label)
                 .into_any_element()
+        } else if !can_install {
+            // Offering a button the manager has no command for would only fail
+            // once it was pressed.
+            div().into_any_element()
         } else {
             let install_pkg = pkg.clone();
             let install_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
@@ -447,9 +462,12 @@ impl App {
                 .into_any_element()
         };
 
-        // Left column
+        // Left column. A flex child will not shrink below what it holds
+        // unless it is told it may, so without this a long description pushes
+        // the row wider than the window and the button off the end of it.
         let mut left = div()
             .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::XXS))
@@ -513,7 +531,10 @@ impl App {
             card_content = card_content.child(checkbox);
         }
 
-        card_content = card_content.child(left).child(install_status);
+        // The button keeps its width; the text beside it is what gives way.
+        card_content = card_content
+            .child(left)
+            .child(div().flex_shrink_0().child(install_status));
 
         let card_bg = if is_selected {
             primary.opacity(0.1)
@@ -771,7 +792,12 @@ impl App {
             .items_center()
             .justify_end();
 
-        if !pkg.installed {
+        let detail_can_install = self
+            .adapter_manager
+            .get_adapter(&pkg.adapter_id)
+            .is_some_and(|a| a.capabilities().can_install);
+
+        if !pkg.installed && detail_can_install {
             let detail_pkey = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
             // Only work still going counts. A record left by something that
             // already finished would otherwise stand in for the button.
@@ -956,6 +982,7 @@ impl App {
     pub fn adapter_badge(&self, adapter_id: &str, _theme: &theme::Theme) -> Div {
         let color = Self::adapter_color(adapter_id);
         div()
+            .flex_shrink_0()
             .px(px(styles::spacing::XS))
             .py(px(styles::spacing::XXXS))
             .rounded(px(styles::radius::SM))
