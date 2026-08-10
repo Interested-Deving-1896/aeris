@@ -230,6 +230,7 @@ impl CommandAdapter {
                     &program,
                     &args,
                     manifest.strip_ansi,
+                    manifest.failure_pattern.as_deref(),
                     context.as_ref(),
                     elevate,
                 );
@@ -244,7 +245,13 @@ impl CommandAdapter {
                 )));
             }
 
-            run_on_terminal(&program, &args, manifest.strip_ansi, context.as_ref())
+            run_on_terminal(
+                &program,
+                &args,
+                manifest.strip_ansi,
+                manifest.failure_pattern.as_deref(),
+                context.as_ref(),
+            )
         })
         .await
         .map_err(|e| AdapterError::Other(format!("could not wait for the run: {e}")))?
@@ -371,6 +378,7 @@ impl CommandAdapter {
             self.program()?,
             &fill_args(op, &Values::new())?,
             false,
+            self.manifest.failure_pattern.as_deref(),
             None,
             false,
         )?
@@ -1123,6 +1131,114 @@ struct Progress {
     pattern: Option<String>,
 }
 
+/// How long the manager has to go quiet before we look at what it left
+/// unfinished and consider whether it is waiting on us.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long someone has to answer before the manager is given up on.
+const ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A stop on how many times one run may ask, so a manager that keeps asking
+/// the same thing cannot go round forever.
+const MOST_QUESTIONS: usize = 20;
+
+/// Whether what a manager left unfinished reads as a question.
+///
+/// A question is the only thing worth interrupting for. A progress bar also
+/// leaves its line unfinished, and rewrites it for as long as the work takes,
+/// which is why silence alone says nothing.
+fn is_a_question(unfinished: &str) -> bool {
+    let asked = unfinished.trim();
+    if asked.is_empty() {
+        return false;
+    }
+
+    asked.contains('?') || {
+        let lowered = asked.to_lowercase();
+        ["[y/n]", "(y/n)", "[yes/no]"]
+            .iter()
+            .any(|form| lowered.contains(form))
+    }
+}
+
+/// Put the question to whoever is watching, and wait for what they say back.
+///
+/// The lines before it come too: a manager asking which of two things to
+/// install has just written out what they are, and the question alone would
+/// be unanswerable.
+fn answer_for(progress: &Progress, printed: &str, question: &str) -> Option<String> {
+    let context: Vec<&str> = printed
+        .lines()
+        .rev()
+        .take(14)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let mut asked = context.join("\n");
+    if !asked.is_empty() {
+        asked.push('\n');
+    }
+    asked.push_str(question);
+
+    let (answer, given) = std::sync::mpsc::channel();
+    progress
+        .sender
+        .send(ProgressEvent::Asked {
+            adapter_id: progress.adapter_id.clone(),
+            package_id: progress.package_id.clone(),
+            question: asked,
+            answer,
+        })
+        .ok()?;
+
+    let said = given.recv_timeout(ANSWER_WINDOW).ok()?;
+    Some(format!("{said}\n"))
+}
+
+/// A manager's line, reduced to something worth putting on a button, or
+/// nothing when the line says nothing at all.
+fn stage_from(line: &str) -> Option<String> {
+    // A progress bar rewrites the one line over and over, and only the last
+    // thing it wrote still stands.
+    let line = line.rsplit('\r').next().unwrap_or(line).trim();
+
+    // Managers mark and grade their lines before saying anything, so
+    // `[+] INFO: Sourcing pacscript` is three characters of decoration, one
+    // word of grading, and then the news.
+    let line = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let line = ["INFO:", "WARNING:", "ERROR:"]
+        .iter()
+        .find_map(|level| line.strip_prefix(level))
+        .unwrap_or(line)
+        .trim();
+
+    if !line.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+
+    Some(if line.chars().count() > STAGE_LIMIT {
+        let kept: String = line.chars().take(STAGE_LIMIT - 1).collect();
+        format!("{}\u{2026}", kept.trim_end())
+    } else {
+        line.to_string()
+    })
+}
+
+/// The line where a manager said it had failed, cleaned of the decoration it
+/// was written with, or nothing when it said no such thing.
+fn complaint(text: &str, pattern: &str) -> Option<String> {
+    let found = text.lines().find(|line| line.contains(pattern))?;
+    let found = found.trim();
+
+    Some(if found.is_empty() {
+        pattern.to_string()
+    } else {
+        found.to_string()
+    })
+}
+
 /// What a run left behind: its answer, and whatever it said beside it.
 struct Ran {
     printed: String,
@@ -1138,6 +1254,7 @@ fn run_on_terminal(
     program: &Path,
     args: &[String],
     strip_ansi: bool,
+    failure: Option<&str>,
     progress: Option<&Progress>,
 ) -> Result<Ran> {
     let pty = portable_pty::native_pty_system()
@@ -1166,32 +1283,105 @@ fn run_on_terminal(
     // finished: our own copy would hold the terminal open past its exit.
     drop(pty.slave);
 
-    let reader = pty
+    let mut reader = pty
         .master
         .try_clone_reader()
         .map_err(|e| AdapterError::Other(format!("could not read the terminal: {e}")))?;
+    let mut writer = pty
+        .master
+        .take_writer()
+        .map_err(|e| AdapterError::Other(format!("could not write to the terminal: {e}")))?;
+
+    // Read bytes rather than lines: a manager asking something leaves the
+    // question unfinished, with no newline behind it, and a reader waiting
+    // for one would sit on the very thing we need to see.
+    let (chunks, arriving) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 || chunks.send(buffer[..read].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
 
     let reporter = progress.map(Reporter::new);
     let mut printed = String::new();
+    // What the manager has written since its last newline. A question lives
+    // here until it is answered.
+    let mut unfinished = String::new();
+    let mut asked = 0usize;
 
-    for line in BufReader::new(reader)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
-        // A terminal ends its lines with a carriage return the reader leaves
-        // behind, and anything anchored to the end of a line would miss.
-        let line = line.trim_end_matches('\r');
-        let line = if strip_ansi {
-            output::strip_ansi(line)
-        } else {
-            line.to_string()
-        };
+    loop {
+        match arriving.recv_timeout(QUIET) {
+            Ok(chunk) => {
+                unfinished.push_str(&String::from_utf8_lossy(&chunk));
 
-        if let Some(reporter) = &reporter {
-            reporter.report(&line);
+                while let Some(at) = unfinished.find('\n') {
+                    let line: String = unfinished.drain(..=at).collect();
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    let line = if strip_ansi {
+                        output::strip_ansi(line)
+                    } else {
+                        line.to_string()
+                    };
+
+                    if let Some(reporter) = &reporter {
+                        reporter.report(&line);
+                    }
+
+                    printed.push_str(&line);
+                    printed.push('\n');
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+
+                let question = output::strip_ansi(&unfinished);
+                if !is_a_question(&question) || asked >= MOST_QUESTIONS {
+                    continue;
+                }
+
+                let Some(progress) = progress else {
+                    // Nobody is listening, so nobody can answer.
+                    let _ = child.kill();
+                    return Err(AdapterError::Other(format!(
+                        "it asked something and there was nobody to answer: {}",
+                        question.trim()
+                    )));
+                };
+
+                asked += 1;
+                match answer_for(progress, &printed, question.trim()) {
+                    Some(answer) => {
+                        printed.push_str(question.trim());
+                        printed.push('\n');
+                        unfinished.clear();
+
+                        if writer.write_all(answer.as_bytes()).is_err() || writer.flush().is_err() {
+                            let _ = child.kill();
+                            return Err(AdapterError::Other(
+                                "the answer could not be given to it".into(),
+                            ));
+                        }
+                    }
+                    None => {
+                        let _ = child.kill();
+                        return Err(AdapterError::Other(format!(
+                            "it asked something that went unanswered: {}",
+                            question.trim()
+                        )));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
 
-        printed.push_str(&line);
+    if !unfinished.trim().is_empty() {
+        printed.push_str(unfinished.trim_end());
         printed.push('\n');
     }
 
@@ -1199,13 +1389,15 @@ fn run_on_terminal(
         AdapterError::Other(format!("could not wait for {}: {e}", program.display()))
     })?;
 
+    if let Some(said) = failure.and_then(|pattern| complaint(&printed, pattern)) {
+        log::error!("{} {} failed: {said}", program.display(), args.join(" "));
+        return Err(AdapterError::Other(said));
+    }
+
     if !status.success() {
-        return Err(AdapterError::Other(format!(
-            "{} {} failed: {}",
-            program.display(),
-            args.join(" "),
-            last_lines(&printed)
-        )));
+        let said = last_lines(&printed);
+        log::error!("{} {} failed: {said}", program.display(), args.join(" "));
+        return Err(AdapterError::Other(said));
     }
 
     Ok(Ran {
@@ -1218,6 +1410,7 @@ fn run(
     program: &Path,
     args: &[String],
     strip_ansi: bool,
+    failure: Option<&str>,
     progress: Option<&Progress>,
     elevate: bool,
 ) -> Result<Ran> {
@@ -1283,15 +1476,28 @@ fn run(
     let status = child.wait().map_err(|e| {
         AdapterError::Other(format!("could not wait for {}: {e}", program.display()))
     })?;
+
+    // Diagnostics are as colourful as the rest, and this text ends up in
+    // front of someone.
     let errors = draining.join().unwrap_or_default();
+    let errors = if strip_ansi {
+        output::strip_ansi(&errors)
+    } else {
+        errors
+    };
+
+    // A manager that says it failed has failed, whatever it exited with.
+    if let Some(said) = failure
+        .and_then(|pattern| complaint(&printed, pattern).or_else(|| complaint(&errors, pattern)))
+    {
+        log::error!("{} {} failed: {said}", program.display(), args.join(" "));
+        return Err(AdapterError::Other(said));
+    }
 
     if !status.success() {
-        return Err(AdapterError::Other(format!(
-            "{} {} failed: {}",
-            program.display(),
-            args.join(" "),
-            last_lines(&errors)
-        )));
+        let said = last_lines(&errors);
+        log::error!("{} {} failed: {said}", program.display(), args.join(" "));
+        return Err(AdapterError::Other(said));
     }
 
     Ok(Ran {
@@ -1302,9 +1508,14 @@ fn run(
 
 /// Keeps the tail of what a failed run complained about.
 fn last_lines(text: &str) -> String {
+    // A manager that prints a stack trace puts it after the thing that went
+    // wrong, so taking the last lines would report how it got there rather
+    // than what happened. Frames are marked with an arrow, and a line of
+    // pure rule says nothing at all.
     let lines: Vec<&str> = text
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .filter(|line| line.chars().any(char::is_alphanumeric) && !line.contains('\u{27a4}'))
         .collect();
     let tail = lines.len().saturating_sub(ERROR_LINES);
     let tail = lines[tail..].join("; ");
@@ -1316,9 +1527,16 @@ fn last_lines(text: &str) -> String {
     }
 }
 
+/// The longest stage worth showing. A manager writing a paragraph is still
+/// telling us one thing, and the button it lands on is not wide.
+const STAGE_LIMIT: usize = 44;
+
 struct Reporter<'a> {
     progress: &'a Progress,
     pattern: Option<regex::Regex>,
+    /// The last stage reported, so a manager repeating itself does not make
+    /// the window redraw for nothing.
+    said: std::cell::RefCell<String>,
 }
 
 impl<'a> Reporter<'a> {
@@ -1328,11 +1546,19 @@ impl<'a> Reporter<'a> {
             .as_deref()
             .and_then(|pattern| regex::Regex::new(pattern).ok());
 
-        Self { progress, pattern }
+        Self {
+            progress,
+            pattern,
+            said: std::cell::RefCell::new(String::new()),
+        }
     }
 
     fn report(&self, line: &str) {
+        // Most managers have nothing machine readable to say while they work.
+        // Their own words are still better than a label that sits at
+        // "Starting" until the whole thing is over.
         if self.progress.map.is_empty() {
+            self.report_in_its_own_words(line);
             return;
         }
 
@@ -1342,6 +1568,25 @@ impl<'a> Reporter<'a> {
         if let Some(event) = self.event(&record) {
             let _ = self.progress.sender.send(event);
         }
+    }
+
+    fn report_in_its_own_words(&self, line: &str) {
+        let Some(stage) = stage_from(line) else {
+            return;
+        };
+
+        if *self.said.borrow() == stage {
+            return;
+        }
+        stage.clone_into(&mut self.said.borrow_mut());
+
+        let _ = self.progress.sender.send(ProgressEvent::Phase {
+            adapter_id: self.progress.adapter_id.clone(),
+            package_id: self.progress.package_id.clone(),
+            phase: stage,
+            // Nothing here says how far along it is, only what it is doing.
+            progress_percent: 0.0,
+        });
     }
 
     fn record(&self, line: &str) -> Option<Value> {
@@ -1820,6 +2065,17 @@ case "$1" in
     echo "description: about $2"
     echo "size: 1.5 MB"
     ;;
+  says-no)
+    # Complains and exits as though all was well, the way some managers do.
+    echo "SKULL ERROR: \"$2\" is not in the database"
+    exit 0
+    ;;
+  asks)
+    # Stops on an unfinished line, the way a manager putting a question does.
+    printf " 1. one thing\n 2. another thing\n Which do you choose? "
+    read -r answer
+    echo "chose $answer"
+    ;;
   terminal)
     # Gives up without a terminal, the way a manager that reads the
     # terminal's settings does.
@@ -2287,9 +2543,9 @@ fields = {{ config = "config", packages_config = "packages_config" }}
 
         // That it fails on a pipe is what makes the terminal the thing under
         // test rather than an ornament.
-        assert!(run(&program, &args, false, None, false).is_err());
+        assert!(run(&program, &args, false, None, None, false).is_err());
 
-        let ran = run_on_terminal(&program, &args, false, None).expect("should answer");
+        let ran = run_on_terminal(&program, &args, false, None, None).expect("should answer");
         assert!(
             ran.printed.contains("answered on a terminal"),
             "{}",
@@ -2337,6 +2593,199 @@ fields = {{ name = "name", version = "version", description = "description", siz
             );
             assert_eq!(entry.install_size, 1_500_000);
         }
+    }
+
+    #[test]
+    fn a_manager_that_fails_in_words_has_failed() {
+        let program = fake_manager("says-no");
+        let manifest = manifest(&format!(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+selector = ["{{name}}"]
+failure_pattern = "SKULL"
+
+[detect]
+command = "{}"
+
+[ops.install]
+args = ["says-no", "{{selector}}"]
+output = {{ format = "lines" }}
+"#,
+            program.display()
+        ));
+        let adapter = CommandAdapter::new(manifest, None).expect("should accept");
+
+        let package = Package {
+            id: "firefox-bin".into(),
+            name: "firefox-bin".into(),
+            version: String::new(),
+            adapter_id: "demo".into(),
+            description: None,
+            size: None,
+            homepage: None,
+            license: None,
+            installed: false,
+            update_available: false,
+            category: None,
+            tags: Vec::new(),
+            icon_url: None,
+        };
+
+        // The command exited cleanly, so only what it said can give it away.
+        let results = block_on(adapter.install(&[package], None, PackageMode::User))
+            .expect("the call itself goes through");
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success, "{:?}", results[0]);
+
+        let why = crate::core::package::failure_among(&results).expect("should name the failure");
+        assert!(why.contains("not in the database"), "{why}");
+    }
+
+    #[test]
+    fn what_went_wrong_is_reported_over_how_it_got_there() {
+        let said = last_lines(
+            "bwrap: Can't mount proc on /newroot/proc: Operation not permitted\n\
+             [!] ERROR: Stacktrace (most recent call last)\n\
+             \u{251c}\u{2500}\u{27a4}MAIN() /usr/bin/pacstall:1053\n\
+             \u{2502}  \u{2570}\u{2500}\u{2500}\u{27a4} if ! source \"package-base.sh\"; then\n\
+             \u{2570}\u{2500}\u{27a4}TRACEBACK: /usr/share/pacstall/scripts/bwrap.sh:27\n",
+        );
+
+        // The trace says how it got there. The line above it says what
+        // happened, and that is the part worth putting in front of someone.
+        assert!(said.contains("Can't mount proc"), "{said}");
+        assert!(!said.contains("MAIN()"), "{said}");
+        assert!(!said.contains("TRACEBACK"), "{said}");
+    }
+
+    #[test]
+    fn a_line_is_reduced_to_the_stage_it_reports() {
+        // Real lines, from the managers this exists for.
+        assert_eq!(
+            stage_from("[+] INFO: Sourcing pacscript").as_deref(),
+            Some("Sourcing pacscript")
+        );
+        assert_eq!(
+            stage_from("\t[>] Building dependency tree").as_deref(),
+            Some("Building dependency tree")
+        );
+        assert_eq!(
+            stage_from("Setting up hello-rhino ...").as_deref(),
+            Some("Setting up hello-rhino ...")
+        );
+        // Long enough that only its beginning fits.
+        assert_eq!(
+            stage_from("Setting up hello-rhino (2025.2-pacstall1) ...").as_deref(),
+            Some("Setting up hello-rhino (2025.2-pacstall1) .\u{2026}")
+        );
+
+        // Nothing worth saying.
+        assert_eq!(stage_from(""), None);
+        assert_eq!(stage_from("   "), None);
+        assert_eq!(stage_from("======="), None);
+        assert_eq!(stage_from(" ├─➤ "), None);
+
+        // A bar rewrites its line, and only the last state stands.
+        assert_eq!(
+            stage_from("Unpacking 10%\rUnpacking 50%\rUnpacking 90%").as_deref(),
+            Some("Unpacking 90%")
+        );
+
+        // Too long to sit on a button.
+        let long = stage_from(&"a".repeat(200)).expect("should say something");
+        assert_eq!(long.chars().count(), STAGE_LIMIT);
+        assert!(long.ends_with('\u{2026}'), "{long}");
+    }
+
+    #[test]
+    fn silence_alone_is_not_a_question() {
+        // A progress bar leaves its line unfinished for as long as the work
+        // takes, and interrupting that would be the common case, not the rare
+        // one.
+        assert!(!is_a_question(""));
+        assert!(!is_a_question("   "));
+        assert!(!is_a_question("hello-rhino 45%[=======>      ]"));
+        assert!(!is_a_question("Unpacking hello-rhino ..."));
+
+        assert!(is_a_question(" Which version you choose (press ENTER)?"));
+        assert!(is_a_question("Overwrite the existing file? [y/N]"));
+        assert!(is_a_question("Continue (y/n)"));
+    }
+
+    #[test]
+    fn a_manager_that_stops_to_ask_is_answered() {
+        let program = fake_manager("asks");
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+
+        let progress = Progress {
+            sender,
+            adapter_id: "demo".into(),
+            package_id: "cat".into(),
+            map: HashMap::new(),
+            format: Format::Lines,
+            pattern: None,
+        };
+
+        // Whoever is watching answers as soon as it is asked.
+        let answering = std::thread::spawn(move || {
+            while let Some(event) = events.blocking_recv() {
+                if let ProgressEvent::Asked {
+                    question, answer, ..
+                } = event
+                {
+                    assert!(question.contains("Which do you choose?"), "{question}");
+                    // The choices came along with it, or the question could
+                    // not be answered.
+                    assert!(question.contains("another thing"), "{question}");
+                    let _ = answer.send("2".to_string());
+                    return true;
+                }
+            }
+            false
+        });
+
+        let ran = run_on_terminal(
+            &program,
+            &["asks".to_string()],
+            false,
+            None,
+            Some(&progress),
+        )
+        .expect("should get through");
+
+        assert!(answering.join().unwrap_or(false), "should have been asked");
+        assert!(ran.printed.contains("chose 2"), "{}", ran.printed);
+    }
+
+    #[test]
+    fn a_question_nobody_answers_gives_up() {
+        let program = fake_manager("asks-unanswered");
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+
+        let progress = Progress {
+            sender,
+            adapter_id: "demo".into(),
+            package_id: "cat".into(),
+            map: HashMap::new(),
+            format: Format::Lines,
+            pattern: None,
+        };
+
+        // Nobody is listening, so the way back closes the moment it is asked.
+        drop(events);
+
+        let Err(err) = run_on_terminal(
+            &program,
+            &["asks".to_string()],
+            false,
+            None,
+            Some(&progress),
+        ) else {
+            panic!("should not wait forever on an answer that cannot come");
+        };
+        assert!(err.to_string().contains("unanswered"), "{err}");
     }
 
     #[test]

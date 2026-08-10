@@ -10,8 +10,8 @@ use crate::{
     adapters::command::{self, CommandAdapter},
     config::AerisConfig,
     core::{
-        adapter::Adapter, adapter_manager::AdapterManager, privilege::PackageMode,
-        registry::PluginEntry,
+        adapter::Adapter, adapter_manager::AdapterManager, package::failure_among,
+        privilege::PackageMode, registry::PluginEntry,
     },
     styles, theme, views,
 };
@@ -403,6 +403,9 @@ pub struct App {
     pub(crate) adapter_manager: AdapterManager,
     pub(crate) adapter_view: AdapterViewState,
     pub(crate) confirm_dialog: Option<ConfirmAction>,
+    /// What a manager stopped to ask, and the way back to it.
+    pub(crate) question: Option<Question>,
+    pub(crate) answer_input: Entity<crate::components::TextInput>,
     pub(crate) run_picker: Option<RunPicker>,
     /// Running processes launched via Run, keyed by package unique_key.
     pub(crate) running_processes: HashMap<String, Vec<RunningProcess>>,
@@ -460,6 +463,15 @@ fn readable(stage: &str) -> String {
 
 fn missing_manifest() -> String {
     "soar did not say where its packages file is".to_string()
+}
+
+/// A manager waiting on an answer, and the way to give it one.
+pub struct Question {
+    pub adapter_id: String,
+    pub package_id: String,
+    /// What it wrote before it stopped, the question last.
+    pub asked: String,
+    pub answer: std::sync::mpsc::Sender<String>,
 }
 
 /// Window during which a change arriving after one of our own writes is
@@ -638,6 +650,7 @@ impl App {
         };
 
         let search_input = cx.new(|cx| crate::components::TextInput::new(cx, "Search packages..."));
+        let answer_input = cx.new(|cx| crate::components::TextInput::new(cx, "Your answer..."));
 
         let (manifest_watcher_rx, manifest_watcher) =
             spawn_manifest_watcher(paths.get("packages_config").map(std::path::Path::new));
@@ -677,6 +690,8 @@ impl App {
             adapter_manager,
             adapter_view: AdapterViewState::default(),
             confirm_dialog: None,
+            question: None,
+            answer_input,
             run_picker: None,
             running_processes: HashMap::new(),
             next_run_id: 1,
@@ -1334,7 +1349,15 @@ impl App {
                                 .update(&pkgs, Some(progress_sender.clone()), mode)
                                 .await
                             {
-                                Ok(_) => log::info!("Updated packages for {adapter_id}"),
+                                Ok(results) => {
+                                    // Answering is not the same as
+                                    // having worked: each package
+                                    // carries its own outcome.
+                                    if let Some(why) = failure_among(&results) {
+                                        log::error!("Update failed for {adapter_id}: {why}");
+                                        errors.push(why);
+                                    }
+                                }
                                 Err(e) => {
                                     log::error!("Update failed for {adapter_id}: {e}");
                                     errors.push(format!("{e}"));
@@ -1427,7 +1450,17 @@ impl App {
                                 .update(&pkgs, Some(progress_sender.clone()), mode)
                                 .await
                             {
-                                Ok(_) => log::info!("Updated selected packages for {adapter_id}"),
+                                Ok(results) => {
+                                    // Answering is not the same as
+                                    // having worked: each package
+                                    // carries its own outcome.
+                                    if let Some(why) = failure_among(&results) {
+                                        log::error!(
+                                            "Update selected failed for {adapter_id}: {why}"
+                                        );
+                                        errors.push(why);
+                                    }
+                                }
                                 Err(e) => {
                                     log::error!("Update selected failed for {adapter_id}: {e}");
                                     errors.push(format!("{e}"));
@@ -1502,7 +1535,7 @@ impl App {
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                crate::tokio_spawn(async move {
+                let errors = crate::tokio_spawn(async move {
                     let mut by_adapter: HashMap<String, Vec<crate::core::package::Package>> =
                         HashMap::new();
                     for pkg in &packages {
@@ -1512,6 +1545,7 @@ impl App {
                             .push(pkg.clone());
                     }
 
+                    let mut errors: Vec<String> = Vec::new();
                     for (adapter_id, pkgs) in by_adapter {
                         if let Some(adapter) =
                             manager_adapters.iter().find(|a| a.info().id == adapter_id)
@@ -1520,13 +1554,22 @@ impl App {
                                 .install(&pkgs, Some(progress_sender.clone()), mode)
                                 .await
                             {
-                                Ok(_) => log::info!("Installed selected packages for {adapter_id}"),
+                                Ok(results) => {
+                                    if let Some(why) = failure_among(&results) {
+                                        log::error!(
+                                            "Install selected failed for {adapter_id}: {why}"
+                                        );
+                                        errors.push(why);
+                                    }
+                                }
                                 Err(e) => {
-                                    log::error!("Install selected failed for {adapter_id}: {e}")
+                                    log::error!("Install selected failed for {adapter_id}: {e}");
+                                    errors.push(format!("{e}"));
                                 }
                             }
                         }
                     }
+                    errors
                 })
                 .await
                 .unwrap_or_default();
@@ -1535,21 +1578,31 @@ impl App {
                     this.update(cx, |app, cx| {
                         app.browse_state.installing = None;
                         app.browse_state.selected.clear();
-                        // Mark installed in search results
-                        for p in &mut app.browse_state.search_results {
-                            if package_ids.contains(&p.id) {
-                                p.installed = true;
+
+                        // Only what actually went through is marked, and the
+                        // reason is worth more than the count when it did not.
+                        if errors.is_empty() {
+                            for p in &mut app.browse_state.search_results {
+                                if package_ids.contains(&p.id) {
+                                    p.installed = true;
+                                }
                             }
+                            app.add_toast(
+                                ToastLevel::Success,
+                                format!("Installed {} packages", package_ids.len()),
+                            );
+                        } else {
+                            app.add_toast(
+                                ToastLevel::Error,
+                                format!("Install failed. {}", errors.join("; ")),
+                            );
                         }
+
                         for key in &progress_keys {
                             app.browse_state.package_progress.remove(key);
                         }
                         app.browse_state.result_version += 1;
                         app.installed_state.loaded = false;
-                        app.add_toast(
-                            ToastLevel::Success,
-                            format!("Installed {} packages", package_ids.len()),
-                        );
                         cx.notify();
                     })
                 });
@@ -2610,6 +2663,12 @@ impl App {
 
     /// Handle the Escape key. Closes the topmost overlay or clears selection.
     pub(crate) fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        // Dropping the way back tells the manager nobody is going to answer,
+        // and it stops rather than waiting out its window.
+        if self.question.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.settings_state.edit.is_some() {
             self.close_settings_edit(cx);
             return;
@@ -2647,6 +2706,13 @@ impl App {
 
     /// Handle Enter to confirm the active dialog.
     pub(crate) fn handle_confirm(&mut self, cx: &mut Context<Self>) {
+        // A manager waiting on an answer is holding everything else up, so
+        // it gets the key first.
+        if self.question.is_some() {
+            self.answer_question(cx);
+            return;
+        }
+
         if let Some(action) = self.confirm_dialog.take() {
             self.execute_confirmed_action(action, cx);
         }
@@ -2662,6 +2728,25 @@ impl App {
             created_at: Instant::now(),
             duration: Duration::from_secs(5),
         });
+    }
+
+    /// Give the manager what was typed, and let it get on with it.
+    pub(crate) fn answer_question(&mut self, cx: &mut Context<Self>) {
+        let Some(question) = self.question.take() else {
+            return;
+        };
+
+        let said = self.answer_input.read(cx).content().trim().to_string();
+        if question.answer.send(said).is_err() {
+            self.add_toast(
+                ToastLevel::Error,
+                "The manager stopped waiting for an answer".into(),
+            );
+        }
+
+        self.answer_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        cx.notify();
     }
 
     fn cleanup_toasts(&mut self) {
@@ -2710,6 +2795,22 @@ impl App {
                 } => {
                     let key = progress_key(&adapter_id, &package_id);
                     self.record_progress(key, OperationStatus::Installing(readable(&phase)));
+                }
+                ProgressEvent::Asked {
+                    adapter_id,
+                    package_id,
+                    question,
+                    answer,
+                } => {
+                    self.answer_input
+                        .update(cx, |input, cx| input.set_content("", cx));
+                    self.question = Some(Question {
+                        adapter_id,
+                        package_id,
+                        asked: question,
+                        answer,
+                    });
+                    cx.notify();
                 }
                 ProgressEvent::Completed {
                     adapter_id,
@@ -2871,7 +2972,11 @@ impl Render for App {
                             (theme.primary.opacity(0.15), theme.primary.opacity(0.3))
                         }
                     };
+                    // A manager can fail at length, and without a width to
+                    // wrap against the message would run off the window
+                    // rather than off the toast.
                     div()
+                        .max_w(px(420.0))
                         .px(px(styles::spacing::LG))
                         .py(px(styles::spacing::SM))
                         .rounded(px(styles::radius::MD))
@@ -2879,6 +2984,7 @@ impl Render for App {
                         .border_1()
                         .border_color(border_color)
                         .text_size(px(styles::font_size::SMALL))
+                        .line_clamp(4)
                         .child(toast.message.clone())
                 })
                 .collect();
@@ -2890,8 +2996,122 @@ impl Render for App {
                     .right(px(styles::spacing::XL))
                     .flex()
                     .flex_col()
+                    .items_end()
                     .gap(px(styles::spacing::SM))
                     .children(toast_elements),
+            );
+        }
+
+        // A manager stopped to ask something. Nothing else can be answered
+        // until this is, since the manager is holding its terminal open
+        // waiting on us.
+        if let Some(question) = self.question.as_ref() {
+            let asked = question.asked.clone();
+            let surface = theme.surface;
+            let border = theme.border;
+            let primary = theme.primary;
+            let hover = theme.hover;
+            let text_muted = theme.text_muted;
+
+            let send = cx.listener(|app, _: &ClickEvent, _window, cx| {
+                app.answer_question(cx);
+            });
+            let give_up = cx.listener(|app, _: &ClickEvent, _window, cx| {
+                // Dropping the way back tells the manager nobody will answer.
+                app.question = None;
+                cx.notify();
+            });
+
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.5,
+                    })
+                    .child(
+                        div()
+                            .w(px(560.0))
+                            .p(px(styles::spacing::XXL))
+                            .rounded(px(styles::radius::LG))
+                            .bg(surface)
+                            .border_1()
+                            .border_color(border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(styles::spacing::MD))
+                            .child(
+                                div()
+                                    .text_size(px(styles::font_size::HEADING))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("The manager is asking"),
+                            )
+                            .child(
+                                div()
+                                    .max_h(px(260.0))
+                                    .overflow_hidden()
+                                    .p(px(styles::spacing::SM))
+                                    .rounded(px(styles::radius::MD))
+                                    .bg(theme.bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_size(px(styles::font_size::SMALL))
+                                    .text_color(text_muted)
+                                    .child(asked),
+                            )
+                            .child(
+                                div()
+                                    .px(px(styles::spacing::MD))
+                                    .py(px(styles::spacing::XS))
+                                    .rounded(px(styles::radius::MD))
+                                    .bg(theme.bg)
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(self.answer_input.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(styles::spacing::SM))
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("question-give-up")
+                                            .px(px(styles::spacing::LG))
+                                            .py(px(styles::spacing::XS))
+                                            .rounded(px(styles::radius::MD))
+                                            .bg(surface)
+                                            .border_1()
+                                            .border_color(border)
+                                            .cursor_pointer()
+                                            .text_size(px(styles::font_size::SMALL))
+                                            .hover(move |st| st.bg(hover))
+                                            .on_click(give_up)
+                                            .child("Give up"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("question-answer")
+                                            .px(px(styles::spacing::LG))
+                                            .py(px(styles::spacing::XS))
+                                            .rounded(px(styles::radius::MD))
+                                            .bg(primary)
+                                            .text_color(gpui::white())
+                                            .cursor_pointer()
+                                            .text_size(px(styles::font_size::SMALL))
+                                            .on_click(send)
+                                            .child("Answer"),
+                                    ),
+                            ),
+                    ),
             );
         }
 
@@ -4086,16 +4306,31 @@ impl App {
                         this.update(cx, |app, cx| {
                             app.browse_state.installing = None;
                             match result {
-                                Ok(Ok(_)) => {
-                                    app.mark_installed(&adapter_id, &package_id, true);
-                                    app.browse_state.package_progress.remove(&progress_key);
-                                    app.add_toast(
-                                        ToastLevel::Success,
-                                        format!("Installed {pkg_name}"),
-                                    );
-                                    // Refresh installed list
-                                    app.installed_state.loaded = false;
-                                }
+                                // An install that answered still has to say it
+                                // worked: the manager reports each package,
+                                // and a failed one comes back this way too.
+                                Ok(Ok(results)) => match failure_among(&results) {
+                                    Some(why) => {
+                                        app.browse_state.package_progress.insert(
+                                            progress_key.clone(),
+                                            OperationStatus::Failed(why.clone()),
+                                        );
+                                        app.add_toast(
+                                            ToastLevel::Error,
+                                            format!("Failed to install {pkg_name}. {why}"),
+                                        );
+                                    }
+                                    None => {
+                                        app.mark_installed(&adapter_id, &package_id, true);
+                                        app.browse_state.package_progress.remove(&progress_key);
+                                        app.add_toast(
+                                            ToastLevel::Success,
+                                            format!("Installed {pkg_name}"),
+                                        );
+                                        // Refresh installed list
+                                        app.installed_state.loaded = false;
+                                    }
+                                },
                                 Ok(Err(e)) => {
                                     app.browse_state.package_progress.insert(
                                         progress_key.clone(),
@@ -4219,12 +4454,16 @@ impl App {
                             app.updates_state.updating = None;
                             app.updates_state.result_version += 1;
                             match result {
-                                Ok(Ok(_)) => {
-                                    app.add_toast(
+                                Ok(Ok(results)) => match failure_among(&results) {
+                                    Some(why) => app.add_toast(
+                                        ToastLevel::Error,
+                                        format!("Failed to update {pkg_name}. {why}"),
+                                    ),
+                                    None => app.add_toast(
                                         ToastLevel::Success,
                                         format!("Updated {pkg_name}"),
-                                    );
-                                }
+                                    ),
+                                },
                                 Ok(Err(e)) => {
                                     app.add_toast(
                                         ToastLevel::Error,
@@ -4285,7 +4524,15 @@ impl App {
                                 .install(&pkgs, Some(progress_sender.clone()), mode)
                                 .await
                             {
-                                Ok(_) => log::info!("Batch install completed for {adapter_id}"),
+                                Ok(results) => {
+                                    // Answering is not the same as
+                                    // having worked: each package
+                                    // carries its own outcome.
+                                    if let Some(why) = failure_among(&results) {
+                                        log::error!("Batch install failed for {adapter_id}: {why}");
+                                        errors.push(why);
+                                    }
+                                }
                                 Err(e) => {
                                     log::error!("Batch install failed for {adapter_id}: {e}");
                                     errors.push(format!("{e}"));
@@ -4433,7 +4680,15 @@ impl App {
                                 .update(&pkgs, Some(progress_sender.clone()), mode)
                                 .await
                             {
-                                Ok(_) => log::info!("Batch update completed for {adapter_id}"),
+                                Ok(results) => {
+                                    // Answering is not the same as
+                                    // having worked: each package
+                                    // carries its own outcome.
+                                    if let Some(why) = failure_among(&results) {
+                                        log::error!("Batch update failed for {adapter_id}: {why}");
+                                        errors.push(why);
+                                    }
+                                }
                                 Err(e) => {
                                     log::error!("Batch update failed for {adapter_id}: {e}");
                                     errors.push(format!("{e}"));
