@@ -253,6 +253,29 @@ pub(crate) fn list_package_binaries(
     out
 }
 
+/// A sentence accounting for the managers this scope leaves out, or nothing
+/// when it leaves none out.
+///
+/// Without it a manager that only installs one way looks like it lost its
+/// packages when the scope is switched.
+pub(crate) fn scope_note(names: &[String], mode: PackageMode) -> Option<String> {
+    let elsewhere = match mode {
+        PackageMode::User => "System",
+        PackageMode::System => "User",
+    };
+
+    match names {
+        [] => None,
+        [one] => Some(format!(
+            "{one} only works in {elsewhere} mode, so its packages are listed there."
+        )),
+        [rest @ .., last] => Some(format!(
+            "{} and {last} only work in {elsewhere} mode, so their packages are listed there.",
+            rest.join(", ")
+        )),
+    }
+}
+
 /// Where the manager links the commands it installs.
 pub(crate) fn active_bin_path(paths: &HashMap<String, String>) -> Option<std::path::PathBuf> {
     paths.get("bin").map(std::path::PathBuf::from)
@@ -617,14 +640,8 @@ impl App {
         self.browse_state.search_debounce_version += 1;
         let version = self.browse_state.search_debounce_version;
 
-        let manager_adapters: Vec<Arc<dyn Adapter>> = self
-            .adapter_manager
-            .list_adapters()
-            .iter()
-            .filter_map(|info| self.adapter_manager.get_adapter(&info.id))
-            .filter(|a| self.adapter_manager.is_enabled(&a.info().id))
-            .collect();
         let mode = self.current_mode;
+        let manager_adapters = self.adapters_for(mode);
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -663,17 +680,28 @@ impl App {
 
     // ---- Business logic stubs ----
 
+    /// The adapters that should answer for a scope.
+    ///
+    /// Enabled, and able to work that way at all: a manager that only
+    /// installs system wide has no user packages, and asking anyway would
+    /// answer with system ones listed under the user's name.
+    fn adapters_for(&self, mode: PackageMode) -> Vec<Arc<dyn Adapter>> {
+        self.adapter_manager
+            .list_adapters()
+            .iter()
+            .filter_map(|info| self.adapter_manager.get_adapter(&info.id))
+            .filter(|a| {
+                self.adapter_manager.is_enabled(&a.info().id) && a.capabilities().works_in(mode)
+            })
+            .collect()
+    }
+
     pub fn load_installed(&mut self, cx: &mut Context<Self>) {
         self.installed_state.loading = true;
         self.installed_state.error = None;
 
-        let manager_adapters: Vec<Arc<dyn Adapter>> = self
-            .adapter_manager
-            .list_adapters()
-            .iter()
-            .filter_map(|info| self.adapter_manager.get_adapter(&info.id))
-            .collect();
         let mode = self.current_mode;
+        let manager_adapters = self.adapters_for(mode);
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -1143,13 +1171,8 @@ impl App {
         self.updates_state.loading = true;
         self.updates_state.error = None;
 
-        let manager_adapters: Vec<Arc<dyn Adapter>> = self
-            .adapter_manager
-            .list_adapters()
-            .iter()
-            .filter_map(|info| self.adapter_manager.get_adapter(&info.id))
-            .collect();
         let mode = self.current_mode;
+        let manager_adapters = self.adapters_for(mode);
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -2312,40 +2335,59 @@ impl App {
             return;
         }
 
-        let bin_path = match active_bin_path(&self.paths) {
-            Some(p) => p,
-            None => {
-                self.add_toast(
-                    ToastLevel::Error,
-                    "Could not locate active profile bin directory".into(),
-                );
-                return;
-            }
-        };
-        let binaries = list_package_binaries(&install_path, &bin_path);
         let package_key = installed.unique_key();
-        match binaries.len() {
-            0 => self.add_toast(
-                ToastLevel::Error,
-                format!(
-                    "No binaries from {} are exposed in {}",
-                    install_path.display(),
-                    bin_path.display()
-                ),
-            ),
-            1 => {
-                let path = binaries.into_iter().next().unwrap();
-                self.spawn_binary(&path, &package_key);
-            }
-            _ => {
-                self.run_picker = Some(RunPicker {
-                    package_name: installed.package.name.clone(),
-                    binaries,
-                    package_key,
+        let package_name = installed.package.name.clone();
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                // Where a manager links what it installs is its own business,
+                // so the package's own adapter is asked rather than assuming
+                // every package went where the built-in one puts things.
+                let paths = crate::tokio_spawn(async move { adapter.paths().await })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(crate::core::adapter::AdapterError::Other(format!("{e}")))
+                    });
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        let Some(bin_path) = paths.as_ref().ok().and_then(active_bin_path) else {
+                            app.add_toast(
+                                ToastLevel::Error,
+                                format!(
+                                    "{package_name} cannot be run: its manager did not say where it links commands"
+                                ),
+                            );
+                            return;
+                        };
+
+                        let binaries = list_package_binaries(&install_path, &bin_path);
+                        match binaries.len() {
+                            0 => app.add_toast(
+                                ToastLevel::Error,
+                                format!(
+                                    "No binaries from {} are exposed in {}",
+                                    install_path.display(),
+                                    bin_path.display()
+                                ),
+                            ),
+                            1 => {
+                                let path = binaries.into_iter().next().unwrap();
+                                app.spawn_binary(&path, &package_key);
+                            }
+                            _ => {
+                                app.run_picker = Some(RunPicker {
+                                    package_name,
+                                    binaries,
+                                    package_key,
+                                });
+                            }
+                        }
+                        cx.notify();
+                    })
                 });
-                cx.notify();
-            }
-        }
+            },
+        )
+        .detach();
     }
 
     pub(crate) fn spawn_binary(&mut self, path: &std::path::Path, package_key: &str) {
@@ -4353,6 +4395,35 @@ mod tests {
     // Deliberately not glob importing the parent: it pulls in gpui's prelude,
     // which shadows the test attribute.
     use super::readable;
+
+    #[test]
+    fn a_scope_accounts_for_the_managers_it_leaves_out() {
+        use super::scope_note;
+        use crate::core::privilege::PackageMode;
+
+        assert_eq!(scope_note(&[], PackageMode::User), None);
+
+        assert_eq!(
+            scope_note(&["Pacstall".to_string()], PackageMode::User).as_deref(),
+            Some("Pacstall only works in System mode, so its packages are listed there.")
+        );
+
+        assert_eq!(
+            scope_note(
+                &["Pacstall".to_string(), "Apt".to_string()],
+                PackageMode::User
+            )
+            .as_deref(),
+            Some("Pacstall and Apt only work in System mode, so their packages are listed there.")
+        );
+
+        // The other way round names the other scope, since what is left out
+        // there is a manager that only works for one person.
+        assert_eq!(
+            scope_note(&["AppMan".to_string()], PackageMode::System).as_deref(),
+            Some("AppMan only works in User mode, so its packages are listed there.")
+        );
+    }
 
     #[test]
     fn work_that_ended_is_not_work_in_flight() {

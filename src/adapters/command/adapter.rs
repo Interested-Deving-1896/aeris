@@ -26,9 +26,9 @@ use crate::views::manifest::{ManifestApplyReport, ManifestDiff, ManifestEntry};
 use super::{
     manifest::{
         self, CommandManifest, Format, OP_ADD_REPO, OP_APPLY, OP_APPLY_CHECK, OP_APPLY_PRUNE,
-        OP_DEFAULT_CONFIG, OP_INFO, OP_INSTALL, OP_LIST, OP_LIST_INSTALLED, OP_LIST_REPOS,
-        OP_LIST_UPDATES, OP_PATHS, OP_REMOVE, OP_REMOVE_REPO, OP_SEARCH, OP_SET_REPO_ENABLED,
-        OP_SYNC, OP_UPDATE, Op, Setting, SettingKind,
+        OP_DEFAULT_CONFIG, OP_INFO, OP_INFO_INSTALLED, OP_INSTALL, OP_LIST, OP_LIST_INSTALLED,
+        OP_LIST_REPOS, OP_LIST_UPDATES, OP_PATHS, OP_REMOVE, OP_REMOVE_REPO, OP_SEARCH,
+        OP_SET_REPO_ENABLED, OP_SYNC, OP_UPDATE, Op, Setting, SettingKind,
     },
     output, version,
 };
@@ -206,6 +206,7 @@ impl CommandAdapter {
         mode: PackageMode,
     ) -> Result<Ran> {
         let op = self.op(op_name)?.clone();
+        let op_name = op_name.to_string();
         let manifest = self.manifest.clone();
         let (program, before, elevate) = self.invocation(mode)?;
         let adapter_id = self.info.id.clone();
@@ -222,16 +223,87 @@ impl CommandAdapter {
                 pattern: op.pattern.clone(),
             });
 
-            run(
-                &program,
-                &args,
-                manifest.strip_ansi,
-                context.as_ref(),
-                elevate,
-            )
+            let elevate = op.elevate.unwrap_or(elevate);
+
+            if !op.needs_terminal {
+                return run(
+                    &program,
+                    &args,
+                    manifest.strip_ansi,
+                    context.as_ref(),
+                    elevate,
+                );
+            }
+
+            // Asking for a password on a terminal nobody can see would wait
+            // for an answer that cannot come, so this is refused rather than
+            // left to hang.
+            if elevate {
+                return Err(AdapterError::Other(format!(
+                    "{op_name} needs a terminal, so it cannot also ask for a password"
+                )));
+            }
+
+            run_on_terminal(&program, &args, manifest.strip_ansi, context.as_ref())
         })
         .await
         .map_err(|e| AdapterError::Other(format!("could not wait for the run: {e}")))?
+    }
+
+    /// Fill in what an installed listing left out, for a manager that names
+    /// its packages and little else.
+    ///
+    /// This costs one run per package, so it is only done for the fields the
+    /// listing actually left empty, and not at all unless the manifest says
+    /// the manager can be asked.
+    async fn fill_from_installed_detail(&self, listed: &mut [InstalledPackage], mode: PackageMode) {
+        let Some(op) = self.manifest.op(OP_INFO_INSTALLED) else {
+            return;
+        };
+
+        let wanted: Vec<&InstalledPackage> = listed
+            .iter()
+            .filter(|entry| entry.package.version.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+
+        let mut found: HashMap<String, Value> = HashMap::new();
+        for entry in wanted {
+            let selector = entry.package.id.clone();
+            let values = Values::from([("selector".to_string(), selector.clone())]);
+            match self.query(OP_INFO_INSTALLED, values, mode).await {
+                Ok(records) => {
+                    if let Some(record) = records.into_iter().next() {
+                        found.insert(selector, record);
+                    }
+                }
+                // One package that will not answer is not worth failing the
+                // whole listing over: it keeps what the listing gave it.
+                Err(e) => log::warn!("{} could not detail {selector}: {e}", self.info.id),
+            }
+        }
+
+        for entry in listed.iter_mut() {
+            let Some(record) = found.get(&entry.package.id) else {
+                continue;
+            };
+
+            if let Some(version) = output::text(record, &op.fields, "version") {
+                entry.package.version = version;
+            }
+            if entry.package.description.is_none() {
+                entry.package.description = output::text(record, &op.fields, "description");
+            }
+            if entry.install_size == 0 {
+                entry.install_size = output::number(record, &op.fields, "size").unwrap_or(0);
+            }
+            if entry.installed_at.is_empty() {
+                entry.installed_at =
+                    output::text(record, &op.fields, "installed_at").unwrap_or_default();
+            }
+        }
     }
 
     /// Read the records a query operation printed.
@@ -512,7 +584,7 @@ impl Adapter for CommandAdapter {
         let records = self.query(OP_LIST_INSTALLED, Values::new(), mode).await?;
         let fields = &self.op(OP_LIST_INSTALLED)?.fields;
 
-        Ok(records
+        let mut listed: Vec<InstalledPackage> = records
             .iter()
             .filter_map(|record| {
                 let mut package = self.to_package(record, fields)?;
@@ -529,7 +601,11 @@ impl Adapter for CommandAdapter {
                     package,
                 })
             })
-            .collect())
+            .collect();
+
+        self.fill_from_installed_detail(&mut listed, mode).await;
+
+        Ok(listed)
     }
 
     async fn list_updates(&self, mode: PackageMode) -> Result<Vec<Update>> {
@@ -988,6 +1064,13 @@ fn scoped_capabilities(
         can_list: has(OP_LIST) || has(OP_LIST_INSTALLED),
         can_list_updates: has(OP_LIST_UPDATES),
         can_sync: has(OP_SYNC),
+        // Running a package means finding the commands it put on the path, so
+        // a manager has to say both where the package went and where it links
+        // what it installs.
+        can_run: has(OP_PATHS)
+            && manifest
+                .op(OP_LIST_INSTALLED)
+                .is_some_and(|op| op.fields.contains_key("path")),
         can_add_repo: has(OP_ADD_REPO),
         can_remove_repo: has(OP_REMOVE_REPO),
         can_list_repos: has(OP_LIST_REPOS),
@@ -1044,6 +1127,91 @@ struct Progress {
 struct Ran {
     printed: String,
     complained: String,
+}
+
+/// Run an operation with a terminal on the other end.
+///
+/// Everything arrives on one stream, because that is what a terminal is:
+/// there is no second channel for what the manager complains about, so a
+/// failure has to be explained out of the same text as the answer.
+fn run_on_terminal(
+    program: &Path,
+    args: &[String],
+    strip_ansi: bool,
+    progress: Option<&Progress>,
+) -> Result<Ran> {
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            // Wide enough that a manager laying its answer out in columns is
+            // not the thing that decides where the text breaks.
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| AdapterError::Other(format!("could not open a terminal: {e}")))?;
+
+    let mut command = portable_pty::CommandBuilder::new(program);
+    command.args(args);
+    // A manager that asks for a terminal usually wants to drive one, so this
+    // has to name a terminal that can do what it asks of it.
+    command.env("TERM", "xterm-256color");
+
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .map_err(|e| AdapterError::Other(format!("could not run {}: {e}", program.display())))?;
+
+    // The end we handed the manager has to go, or nothing ever reads as
+    // finished: our own copy would hold the terminal open past its exit.
+    drop(pty.slave);
+
+    let reader = pty
+        .master
+        .try_clone_reader()
+        .map_err(|e| AdapterError::Other(format!("could not read the terminal: {e}")))?;
+
+    let reporter = progress.map(Reporter::new);
+    let mut printed = String::new();
+
+    for line in BufReader::new(reader)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        // A terminal ends its lines with a carriage return the reader leaves
+        // behind, and anything anchored to the end of a line would miss.
+        let line = line.trim_end_matches('\r');
+        let line = if strip_ansi {
+            output::strip_ansi(line)
+        } else {
+            line.to_string()
+        };
+
+        if let Some(reporter) = &reporter {
+            reporter.report(&line);
+        }
+
+        printed.push_str(&line);
+        printed.push('\n');
+    }
+
+    let status = child.wait().map_err(|e| {
+        AdapterError::Other(format!("could not wait for {}: {e}", program.display()))
+    })?;
+
+    if !status.success() {
+        return Err(AdapterError::Other(format!(
+            "{} {} failed: {}",
+            program.display(),
+            args.join(" "),
+            last_lines(&printed)
+        )));
+    }
+
+    Ok(Ran {
+        printed,
+        complained: String::new(),
+    })
 }
 
 fn run(
@@ -1343,6 +1511,67 @@ progress = { event = "type", current = "current", total = "total", message = "pk
     }
 
     #[test]
+    fn running_needs_both_a_bin_directory_and_a_package_path() {
+        let both = manifest(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+
+[detect]
+command = "demo"
+[ops.paths]
+args = ["paths"]
+output = { format = "json" }
+fields = { bin = "bin" }
+
+[ops.list_installed]
+args = ["installed"]
+output = { format = "json" }
+fields = { name = "name", path = "installed_path" }
+"#,
+        );
+        assert!(capabilities_from(&both).can_run);
+
+        let no_path = manifest(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+
+[detect]
+command = "demo"
+[ops.paths]
+args = ["paths"]
+output = { format = "json" }
+fields = { bin = "bin" }
+
+[ops.list_installed]
+args = ["installed"]
+output = { format = "json" }
+fields = { name = "name" }
+"#,
+        );
+        assert!(!capabilities_from(&no_path).can_run);
+
+        let no_paths_op = manifest(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+
+[detect]
+command = "demo"
+[ops.list_installed]
+args = ["installed"]
+output = { format = "json" }
+fields = { name = "name", path = "installed_path" }
+"#,
+        );
+        assert!(!capabilities_from(&no_paths_op).can_run);
+    }
+
+    #[test]
     fn a_package_takes_the_most_specific_name_its_manager_understands() {
         let adapter = adapter(manifest(DEMO));
         let fields = &adapter.manifest.op(OP_SEARCH).unwrap().fields;
@@ -1580,6 +1809,22 @@ case "$1" in
     ;;
   paths)
     printf '{"config":"%s.config.toml","packages_config":"%s.packages.toml"}\n' "$0" "$0"
+    ;;
+  installed-thin)
+    # Names and nothing else, the way a manager with a bare listing answers.
+    echo '{"items":[{"name":"cat"},{"name":"dog"}],"total":2}'
+    ;;
+  detail)
+    echo "name: $2"
+    echo "version: 2.0"
+    echo "description: about $2"
+    echo "size: 1.5 MB"
+    ;;
+  terminal)
+    # Gives up without a terminal, the way a manager that reads the
+    # terminal's settings does.
+    stty -g >/dev/null 2>&1 || { echo "no terminal here" >&2; exit 1; }
+    echo "answered on a terminal"
     ;;
   boom)
     echo "it went wrong" >&2
@@ -1932,6 +2177,70 @@ fields = {{ config = "config", packages_config = "packages_config" }}
     }
 
     #[test]
+    fn a_terminal_operation_will_not_also_ask_for_a_password() {
+        let program = fake_manager("terminal-elevated");
+        let manifest = manifest(&format!(
+            "system_only = true\n{}\n[ops.list_updates]\nargs = [\"terminal\"]\nneeds_terminal = true\noutput = {{ format = \"lines\" }}\n\n[system]\nelevate = true\n",
+            manifest_for(&program, "1.0.0")
+        ));
+        let adapter = CommandAdapter::new(manifest, None).expect("should accept");
+
+        // Waiting on a password nobody can be shown would hang, so this has
+        // to come back as a failure rather than not come back.
+        let Err(err) = block_on(adapter.run(
+            OP_LIST_UPDATES,
+            Values::new(),
+            None,
+            String::new(),
+            PackageMode::System,
+        )) else {
+            panic!("should refuse to ask for a password on a hidden terminal");
+        };
+        assert!(err.to_string().contains("cannot also ask"), "{err}");
+    }
+
+    #[test]
+    fn an_operation_that_says_it_needs_no_password_does_not_ask() {
+        let program = fake_manager("terminal-unelevated");
+        let manifest = manifest(&format!(
+            "system_only = true\n{}\n[ops.list_updates]\nargs = [\"terminal\"]\nneeds_terminal = true\nelevate = false\noutput = {{ format = \"lines\" }}\n\n[system]\nelevate = true\n",
+            manifest_for(&program, "1.0.0")
+        ));
+        let adapter = CommandAdapter::new(manifest, None).expect("should accept");
+
+        let ran = block_on(adapter.run(
+            OP_LIST_UPDATES,
+            Values::new(),
+            None,
+            String::new(),
+            PackageMode::System,
+        ))
+        .expect("should answer");
+        assert!(
+            ran.printed.contains("answered on a terminal"),
+            "{}",
+            ran.printed
+        );
+    }
+
+    #[test]
+    fn a_system_only_manager_has_no_user_packages_to_offer() {
+        let program = fake_manager("scope");
+        let manifest = manifest(&format!(
+            "system_only = true\n{}\n[system]\nelevate = true\n",
+            manifest_for(&program, "1.0.0")
+        ));
+        let adapter = CommandAdapter::new(manifest, None).expect("should accept");
+        let capabilities = *adapter.capabilities();
+
+        // It still answers when asked, which is why the asking has to be the
+        // thing that stops: its answer would be system packages under the
+        // user's name.
+        assert!(!capabilities.works_in(PackageMode::User));
+        assert!(capabilities.works_in(PackageMode::System));
+    }
+
+    #[test]
     fn an_operation_a_manifest_does_not_declare_is_not_supported() {
         let program = fake_manager("undeclared");
         let manifest = manifest(&manifest_for(&program, "1.0.0"));
@@ -1969,6 +2278,65 @@ fields = {{ config = "config", packages_config = "packages_config" }}
             panic!("should refuse an empty answer");
         };
         assert!(err.to_string().contains("answered nothing"), "{err}");
+    }
+
+    #[test]
+    fn an_operation_that_needs_a_terminal_is_given_one() {
+        let program = fake_manager("terminal");
+        let args = vec!["terminal".to_string()];
+
+        // That it fails on a pipe is what makes the terminal the thing under
+        // test rather than an ornament.
+        assert!(run(&program, &args, false, None, false).is_err());
+
+        let ran = run_on_terminal(&program, &args, false, None).expect("should answer");
+        assert!(
+            ran.printed.contains("answered on a terminal"),
+            "{}",
+            ran.printed
+        );
+    }
+
+    #[test]
+    fn a_thin_installed_listing_is_filled_in_one_package_at_a_time() {
+        let program = fake_manager("thin");
+        let manifest = manifest(&format!(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+selector = ["{{name}}"]
+
+[detect]
+command = "{}"
+
+[ops.list_installed]
+args = ["installed-thin"]
+output = {{ format = "json", select = "$.items[*]" }}
+fields = {{ name = "name" }}
+
+[ops.info_installed]
+args = ["detail", "{{selector}}"]
+output = {{ format = "keyvalue" }}
+fields = {{ name = "name", version = "version", description = "description", size = "size" }}
+"#,
+            program.display()
+        ));
+        let adapter = CommandAdapter::new(manifest, None).expect("should accept");
+
+        let listed = block_on(adapter.list_installed(PackageMode::User)).expect("should list");
+        assert_eq!(listed.len(), 2);
+
+        // The listing gave a name and nothing else, so each of these came
+        // from asking about that package on its own.
+        for entry in &listed {
+            assert_eq!(entry.package.version, "2.0", "{:?}", entry.package.name);
+            assert_eq!(
+                entry.package.description.as_deref(),
+                Some(format!("about {}", entry.package.name).as_str())
+            );
+            assert_eq!(entry.install_size, 1_500_000);
+        }
     }
 
     #[test]
