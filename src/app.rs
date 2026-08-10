@@ -28,6 +28,9 @@ pub fn bind_app_keys(cx: &mut gpui::App) {
 }
 
 pub const APP_NAME: &str = "Aeris";
+
+/// The manager aeris ships knowing about.
+pub const SOAR_ID: &str = "soar";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -287,6 +290,8 @@ pub struct App {
     pub(crate) aeris_config: AerisConfig,
     /// The manager aeris drives, absent when none could be reached.
     pub(crate) adapter: Option<Arc<dyn Adapter>>,
+    /// Why soar could not be used, for the adapters page to explain.
+    pub(crate) soar_problem: Option<String>,
     /// Where the manager keeps its files, read once at startup. Aeris edits
     /// some of them directly rather than through a command for every field.
     pub(crate) paths: HashMap<String, String>,
@@ -453,13 +458,17 @@ impl App {
         let startup_view = aeris_config.startup_view();
 
         let mut adapter_manager = AdapterManager::new();
-        let mut startup_problem = None;
+        let mut soar_problem = None;
         let mut paths = HashMap::new();
 
-        // Soar describes itself, so aeris drives whichever one is installed
-        // rather than the one it was built against.
-        let adapter: Option<Arc<dyn Adapter>> =
-            match CommandAdapter::from_command("soar", command::DESCRIBE_ARGS)
+        // Turned off means left alone: no looking for it, and nothing said
+        // about not finding it.
+        let adapter: Option<Arc<dyn Adapter>> = if aeris_config.is_adapter_disabled(SOAR_ID) {
+            None
+        } else {
+            // Soar describes itself, so aeris drives whichever one is
+            // installed rather than the one it was built against.
+            match CommandAdapter::from_command(SOAR_ID, command::DESCRIBE_ARGS)
                 .map(CommandAdapter::as_builtin)
             {
                 Ok(soar) => {
@@ -473,12 +482,19 @@ impl App {
                     adapter_manager.register(adapter.clone());
                     Some(adapter)
                 }
+                // Said on the adapters page instead of thrown as a message,
+                // so it can be read once and turned off rather than met at
+                // every start.
                 Err(e) => {
-                    log::error!("Soar is unavailable: {e}");
-                    startup_problem = Some(format!("Soar is unavailable: {e}"));
+                    log::warn!("Soar is unavailable: {e}");
+                    soar_problem = Some(match &e {
+                        crate::core::adapter::AdapterError::PluginError(said) => said.clone(),
+                        other => other.to_string(),
+                    });
                     None
                 }
-            };
+            }
+        };
 
         for result in crate::adapters::command::load_all() {
             match result {
@@ -494,7 +510,24 @@ impl App {
             aeris_config.disabled_adapters.iter().cloned().collect();
         adapter_manager.set_disabled(disabled);
 
-        let default_mode = PackageMode::User;
+        // Whichever scope the adapters actually work in. A manager that only
+        // ever acts system wide would otherwise have its packages counted and
+        // labelled as the user's.
+        let default_mode = if adapter_manager
+            .list_adapters()
+            .iter()
+            .any(|info| info.capabilities.supports_user_packages)
+        {
+            PackageMode::User
+        } else if adapter_manager
+            .list_adapters()
+            .iter()
+            .any(|info| info.capabilities.supports_system_packages)
+        {
+            PackageMode::System
+        } else {
+            PackageMode::User
+        };
         let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let settings_state = match adapter.as_ref() {
@@ -536,6 +569,7 @@ impl App {
             sidebar_expanded: false,
             aeris_config,
             adapter,
+            soar_problem,
             paths,
             last_self_write: std::cell::Cell::new(None),
             adapter_manager,
@@ -547,18 +581,7 @@ impl App {
             active_operation: None,
             package_progress: HashMap::new(),
             next_operation_id: 1,
-            toasts: startup_problem
-                .into_iter()
-                .map(|message| Toast {
-                    id: 0,
-                    level: ToastLevel::Error,
-                    message,
-                    created_at: Instant::now(),
-                    // Long enough to read, since nothing else explains why the
-                    // window is empty.
-                    duration: Duration::from_secs(30),
-                })
-                .collect(),
+            toasts: Vec::new(),
             next_toast_id: 1,
             batch_progress: None,
             progress_sender,
@@ -1654,6 +1677,113 @@ impl App {
         }
     }
 
+    /// Adapters whose manifest is on disk but which cannot be used, with the
+    /// command each is missing.
+    ///
+    /// These exist as far as the person who added them is concerned, so the
+    /// page has to account for them rather than leave them nowhere.
+    pub fn unusable_adapters(&self) -> Vec<(crate::core::adapter::AdapterInfo, String)> {
+        let mut unusable = Vec::new();
+
+        // Soar has a place on this page whether or not it can run, so there
+        // is always something to turn back on.
+        if self.adapter_manager.get_adapter(SOAR_ID).is_none() {
+            // Already a whole sentence, since detection is what produced it.
+            let reason = self
+                .soar_problem
+                .clone()
+                .unwrap_or_else(|| "soar is not installed".to_string());
+
+            unusable.push((
+                crate::core::adapter::AdapterInfo {
+                    id: SOAR_ID.to_string(),
+                    name: "Soar".to_string(),
+                    version: String::new(),
+                    capabilities: Default::default(),
+                    enabled: false,
+                    is_builtin: true,
+                    plugin_path: None,
+                    description: "Fast package manager for static binaries".to_string(),
+                    icon: None,
+                },
+                reason,
+            ));
+        }
+
+        unusable.extend(
+            crate::adapters::command::manifest::discover()
+                .into_iter()
+                .filter(|(_, manifest)| self.adapter_manager.get_adapter(&manifest.id).is_none())
+                .map(|(path, manifest)| {
+                    let capabilities =
+                        crate::adapters::command::adapter::capabilities_from(&manifest);
+                    // Nothing is run from here, so the command being absent is
+                    // the reason worth assuming and the one worth saying.
+                    let reason = format!("{} is not installed", manifest.detect.command);
+
+                    (
+                        crate::core::adapter::AdapterInfo {
+                            id: manifest.id,
+                            name: manifest.name,
+                            version: manifest.version,
+                            capabilities,
+                            enabled: false,
+                            is_builtin: false,
+                            plugin_path: Some(path),
+                            description: manifest.description,
+                            icon: manifest.icon,
+                        },
+                        reason,
+                    )
+                }),
+        );
+
+        unusable
+    }
+
+    /// Try again to use an adapter whose command was missing, now that it
+    /// might not be.
+    pub fn retry_adapter(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some((path, manifest)) = crate::adapters::command::manifest::discover()
+            .into_iter()
+            .find(|(_, manifest)| manifest.id == id)
+        else {
+            return;
+        };
+
+        let name = manifest.name.clone();
+        match CommandAdapter::new(manifest, Some(path)) {
+            Ok(adapter) => {
+                register_new(&mut self.adapter_manager, Arc::new(adapter));
+                self.add_toast(ToastLevel::Success, format!("{name} is ready"));
+            }
+            Err(e) => {
+                use crate::core::adapter::AdapterError;
+
+                let reason = match &e {
+                    AdapterError::PluginError(said) => said.clone(),
+                    other => other.to_string(),
+                };
+                self.add_toast(
+                    ToastLevel::Error,
+                    format!("{name} still cannot run: {reason}"),
+                );
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// Forget an adapter that was added but never worked.
+    pub fn forget_adapter(&mut self, id: String, cx: &mut Context<Self>) {
+        match crate::core::registry::remove_plugin(&id) {
+            Ok(()) => self.add_toast(ToastLevel::Success, format!("Removed {id}")),
+            Err(e) => self.add_toast(ToastLevel::Error, format!("Could not remove {id}: {e}")),
+        }
+
+        cx.notify();
+    }
+
     /// Show whatever was read last, and read again if that was long enough
     /// ago. Called when the adapters page is opened.
     pub fn consider_registry(&mut self, cx: &mut Context<Self>) {
@@ -1736,12 +1866,21 @@ impl App {
                                         app.add_toast(ToastLevel::Success, format!("Added {name}"));
                                     }
                                     // The manifest is sound but the manager it
-                                    // describes is missing or too old. Keeping
-                                    // it means installing that is enough.
-                                    Err(e) => app.add_toast(
-                                        ToastLevel::Error,
-                                        format!("Kept the manifest for {name}, but {e}"),
-                                    ),
+                                    // describes is missing or too old. It is
+                                    // kept either way, so installing that is
+                                    // all it takes.
+                                    Err(e) => {
+                                        use crate::core::adapter::AdapterError;
+
+                                        let reason = match &e {
+                                            AdapterError::PluginError(said) => said.clone(),
+                                            other => other.to_string(),
+                                        };
+                                        app.add_toast(
+                                            ToastLevel::Error,
+                                            format!("Added {name}, but {reason}"),
+                                        )
+                                    }
                                 }
                             }
                             Err(e) => app
@@ -3681,10 +3820,9 @@ impl App {
 
         // Offered only where the manager says it can act system wide, which
         // needs privileges nothing here knows how to ask for otherwise.
-        if !self
-            .adapter
-            .as_ref()
-            .is_some_and(|adapter| adapter.capabilities().supports_system_packages)
+        // Worth offering only when there is more than one way to work.
+        if !(self.any_adapter_works_in(PackageMode::User)
+            && self.any_adapter_works_in(PackageMode::System))
         {
             return header;
         }
@@ -3708,11 +3846,29 @@ impl App {
         )
     }
 
+    /// Whether any adapter in use works in the given scope.
+    pub(crate) fn any_adapter_works_in(&self, mode: PackageMode) -> bool {
+        self.adapter_manager.list_adapters().iter().any(|info| {
+            self.adapter_manager.is_enabled(&info.id)
+                && match mode {
+                    PackageMode::User => info.capabilities.supports_user_packages,
+                    PackageMode::System => info.capabilities.supports_system_packages,
+                }
+        })
+    }
+
     pub(crate) fn toggle_mode(&mut self, cx: &mut Context<Self>) {
-        self.current_mode = match self.current_mode {
+        let wanted = match self.current_mode {
             PackageMode::User => PackageMode::System,
             PackageMode::System => PackageMode::User,
         };
+
+        // Nothing works that way, so there is nothing to switch to.
+        if !self.any_adapter_works_in(wanted) {
+            return;
+        }
+
+        self.current_mode = wanted;
         // Invalidate per-view caches so they reload for the new mode
         self.installed_state.loaded = false;
         self.installed_state.packages.clear();

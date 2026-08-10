@@ -32,7 +32,17 @@ impl App {
 
         let mut adapters = self.adapter_manager.list_adapters_with_status();
         adapters.sort_by(|(a, _), (b, _)| b.is_builtin.cmp(&a.is_builtin));
-        let installed_ids: Vec<String> = adapters.iter().map(|(info, _)| info.id.clone()).collect();
+
+        // Added but not usable, because whatever they drive is missing. They
+        // belong with the installed ones: that is where someone who added
+        // them will look.
+        let unusable = self.unusable_adapters();
+
+        let installed_ids: Vec<String> = adapters
+            .iter()
+            .map(|(info, _)| info.id.clone())
+            .chain(unusable.iter().map(|(info, _)| info.id.clone()))
+            .collect();
 
         let header = div()
             .text_size(px(styles::font_size::TITLE))
@@ -71,6 +81,10 @@ impl App {
 
         // Separator
         content = content.child(div().w_full().h(px(2.0)).bg(border));
+
+        for (info, reason) in &unusable {
+            content = content.child(self.render_unusable_card(info, reason, theme, cx));
+        }
 
         // Available plugins section
         content = content.child(
@@ -132,8 +146,20 @@ impl App {
                 has_available = true;
                 let is_installing =
                     self.adapter_view.installing_plugin.as_deref() == Some(&entry.id);
-                content =
-                    content.child(self.render_registry_card(&entry, is_installing, theme, cx));
+
+                // Kept on disk but not in use, because the command it drives
+                // is not installed. Saying so beats offering to add it again.
+                let waiting_for = (!installed_ids.iter().any(|id| id == &entry.id))
+                    .then(|| crate::core::registry::installed_needs(&entry.id))
+                    .flatten();
+
+                content = content.child(self.render_registry_card(
+                    &entry,
+                    is_installing,
+                    waiting_for,
+                    theme,
+                    cx,
+                ));
             }
 
             if !has_available {
@@ -830,10 +856,154 @@ impl App {
             )
     }
 
+    /// An adapter that was added but cannot run, and what it is missing.
+    fn render_unusable_card(
+        &self,
+        info: &AdapterInfo,
+        reason: &str,
+        theme: &theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = info.id.as_str();
+        let surface = theme.surface;
+        let border = theme.border;
+        let hover = theme.hover;
+
+        let retrying = id.to_string();
+        let retry = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.retry_adapter(retrying.clone(), cx);
+        });
+
+        let forgetting = id.to_string();
+        let forget = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.forget_adapter(forgetting.clone(), cx);
+        });
+
+        // Turning it off is what stops aeris looking for something that is
+        // not there, so this has to work whether or not it does.
+        let disabled = !self.adapter_manager.is_enabled(id);
+        let toggling = id.to_string();
+        let toggle = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.adapter_manager.set_adapter_enabled(&toggling, disabled);
+            app.aeris_config.set_adapter_disabled(&toggling, !disabled);
+            let _ = app.aeris_config.save();
+            cx.notify();
+        });
+
+        /// Both buttons look the same and differ only in what they do.
+        type Clicked = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App)>;
+
+        let button = |label: &str, element_id: String, listener: Clicked| {
+            div()
+                .id(SharedString::from(element_id))
+                .px(px(styles::spacing::SM))
+                .py(px(styles::spacing::XS))
+                .rounded(px(styles::radius::MD))
+                .bg(surface)
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .text_size(px(styles::font_size::SMALL))
+                .hover(move |s| s.bg(hover))
+                .on_click(listener)
+                .child(label.to_string())
+        };
+
+        div()
+            .p(px(styles::spacing::LG))
+            .rounded(px(styles::radius::LG))
+            .bg(surface)
+            .border_1()
+            .border_color(border)
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(styles::spacing::SM))
+            .child({
+                let mut header = div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(styles::spacing::SM))
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(styles::font_size::HEADING))
+                            .child(info.name.clone()),
+                    );
+
+                if !info.version.is_empty() {
+                    header = header.child(self.badge_neutral(&format!("v{}", info.version), theme));
+                }
+
+                let kind = if info.is_builtin {
+                    "Built-in"
+                } else {
+                    "Plugin"
+                };
+
+                header
+                    .child(self.badge_neutral(kind, theme))
+                    .child(self.badge_neutral("unavailable", theme))
+            })
+            .child(
+                div()
+                    .text_size(px(styles::font_size::BODY))
+                    .child(info.description.clone()),
+            )
+            .child({
+                // Turned off is a choice; missing is a problem. They should
+                // not read the same.
+                let (colour, said) = if disabled {
+                    (
+                        theme.text_muted,
+                        "Turned off, so aeris does not look for it".to_string(),
+                    )
+                } else {
+                    (
+                        // Already a sentence, from whoever worked out that it
+                        // could not run.
+                        theme.warning,
+                        reason.to_string(),
+                    )
+                };
+
+                div()
+                    .text_size(px(styles::font_size::SMALL))
+                    .text_color(colour)
+                    .child(said)
+            })
+            .child(self.render_capabilities(info.capabilities, theme))
+            .child({
+                let mut actions = div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(styles::spacing::SM))
+                    .child(button(
+                        "Check again",
+                        format!("retry-{id}"),
+                        Box::new(retry),
+                    ))
+                    .child(button(
+                        if disabled { "Enable" } else { "Disable" },
+                        format!("toggle-missing-{id}"),
+                        Box::new(toggle),
+                    ));
+
+                // What aeris ships with stays; only what was added can go.
+                if !info.is_builtin {
+                    actions =
+                        actions.child(button("Remove", format!("forget-{id}"), Box::new(forget)));
+                }
+
+                actions
+            })
+    }
+
     fn render_registry_card(
         &self,
         entry: &PluginEntry,
         installing: bool,
+        waiting_for: Option<String>,
         theme: &theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -878,17 +1048,22 @@ impl App {
                 app.install_plugin(wanted.clone(), cx);
             });
 
-            let label = match crate::core::registry::update_for(entry) {
-                Some(newer) => format!("Update to {newer}"),
-                None => "Install".to_string(),
+            let label = match (&waiting_for, crate::core::registry::update_for(entry)) {
+                // Already added, so the thing to offer is another look once
+                // the missing command has been installed.
+                (Some(_), _) => "Check again".to_string(),
+                (None, Some(newer)) => format!("Update to {newer}"),
+                (None, None) => "Install".to_string(),
             };
+
+            let waiting = waiting_for.is_some();
 
             div()
                 .id(SharedString::from(format!("install-plugin-{}", entry.id)))
                 .px(px(styles::spacing::SM))
                 .py(px(styles::spacing::XS))
                 .rounded(px(styles::radius::MD))
-                .bg(primary)
+                .bg(if waiting { surface } else { primary })
                 .text_color(gpui::white())
                 .text_size(px(styles::font_size::SMALL))
                 .cursor_pointer()
@@ -896,7 +1071,7 @@ impl App {
                 .child(label)
         };
 
-        div()
+        let mut card = div()
             .p(px(styles::spacing::LG))
             .rounded(px(styles::radius::LG))
             .bg(surface)
@@ -907,8 +1082,24 @@ impl App {
             .flex_col()
             .gap(px(styles::spacing::SM))
             .child(header)
-            .child(desc)
-            .child(action)
+            .child(desc);
+
+        // What is missing is worth a sentence rather than a cramped label.
+        if let Some(command) = &waiting_for {
+            card = card.child(
+                div()
+                    .text_size(px(styles::font_size::SMALL))
+                    .text_color(theme.warning)
+                    .child(format!(
+                        "Added, but the {command} command is not installed yet"
+                    )),
+            );
+        }
+
+        card
+            // In a column every child is stretched to the full width, so the
+            // button needs a row of its own to be only as wide as its label.
+            .child(div().flex().flex_row().child(action))
     }
 
     fn render_capabilities(&self, caps: Capabilities, theme: &theme::Theme) -> impl IntoElement {
