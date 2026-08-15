@@ -448,7 +448,8 @@ impl App {
                     .text_color(success)
                     .font_weight(FontWeight::MEDIUM)
                     .child(update.new_version.clone()),
-            );
+            )
+            .child(self.adapter_badge(&update.package.adapter_id, theme));
 
         let mut info_row = div()
             .flex()
