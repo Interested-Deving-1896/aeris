@@ -2122,6 +2122,7 @@ impl App {
                     id: SOAR_ID.to_string(),
                     name: "Soar".to_string(),
                     version: String::new(),
+                    manifest_version: String::new(),
                     capabilities: Default::default(),
                     enabled: false,
                     is_builtin: true,
@@ -2148,6 +2149,7 @@ impl App {
                         crate::core::adapter::AdapterInfo {
                             id: manifest.id,
                             name: manifest.name,
+                            manifest_version: manifest.version.clone(),
                             version: manifest.version,
                             capabilities,
                             enabled: false,

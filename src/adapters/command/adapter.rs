@@ -102,6 +102,7 @@ impl CommandAdapter {
             // The version of the manager being driven, not of the manifest,
             // because that is what decides how it behaves.
             version: found.unwrap_or_else(|| manifest.version.clone()),
+            manifest_version: manifest.version.clone(),
             capabilities,
             enabled: true,
             is_builtin: false,
@@ -1772,6 +1773,7 @@ progress = { event = "type", current = "current", total = "total", message = "pk
                 id: manifest.id.clone(),
                 name: manifest.name.clone(),
                 version: "1.0".into(),
+                manifest_version: manifest.version.clone(),
                 capabilities,
                 enabled: true,
                 is_builtin: false,

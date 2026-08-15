@@ -277,6 +277,20 @@ impl App {
                     .child(format!("v{}", info.version)),
             );
 
+        // The manager's version is not the manifest's, and the registry
+        // offers updates to the manifest. Saying only one of them invites
+        // reading an update to the manifest as a downgrade of the manager.
+        let name_row =
+            match info.manifest_version.is_empty() || info.manifest_version == info.version {
+                true => name_row,
+                false => name_row.child(
+                    div()
+                        .text_size(px(styles::font_size::CAPTION))
+                        .text_color(text_muted)
+                        .child(format!("adapter v{}", info.manifest_version)),
+                ),
+            };
+
         // Type badge
         let type_label = if info.is_builtin {
             "Built-in"
@@ -1095,7 +1109,7 @@ impl App {
                 // Already added, so the thing to offer is another look once
                 // the missing command has been installed.
                 (Some(_), _) => "Check again".to_string(),
-                (None, Some(newer)) => format!("Update to {newer}"),
+                (None, Some(newer)) => format!("Update adapter to {newer}"),
                 (None, None) => "Install".to_string(),
             };
 

@@ -110,7 +110,12 @@ pub type Result<T> = std::result::Result<T, AdapterError>;
 pub struct AdapterInfo {
     pub id: AdapterId,
     pub name: String,
+    /// The version of the manager being driven.
     pub version: String,
+    /// The version of the manifest describing it, which is what the registry
+    /// offers updates to. A manager keeps its own version, and the two move
+    /// apart the moment either is updated without the other.
+    pub manifest_version: String,
     pub capabilities: Capabilities,
     pub enabled: bool,
     pub is_builtin: bool,
