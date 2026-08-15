@@ -26,6 +26,9 @@ pub struct BrowseState {
     pub search_debounce_version: u64,
     pub selected: HashSet<String>,
     pub package_progress: HashMap<String, OperationStatus>,
+    /// The managers the search is narrowed to. Empty means every one of them,
+    /// which is also what a fresh window starts with.
+    pub manager_filter: HashSet<String>,
 }
 
 impl App {
@@ -47,8 +50,7 @@ impl App {
             if !current_query.is_empty() {
                 self.perform_search(cx);
             } else {
-                self.browse_state.search_results.clear();
-                self.browse_state.has_searched = false;
+                self.abandon_search();
             }
         }
 
@@ -161,7 +163,7 @@ impl App {
         // Build the browse list
         // The search box and what it found stay put while the results move,
         // so the box is always there to type in.
-        let search_header = div()
+        let mut search_header = div()
             .flex_shrink_0()
             .w_full()
             .px(px(styles::spacing::XL))
@@ -170,8 +172,15 @@ impl App {
             .flex()
             .flex_col()
             .gap(px(styles::spacing::SM))
-            .child(search_bar)
-            .child(result_count);
+            .child(search_bar);
+
+        // Only worth offering a choice when there is one to make.
+        let searchable = self.searchable_adapter_ids(self.current_mode);
+        if searchable.len() > 1 {
+            search_header = search_header.child(self.render_manager_filter(&searchable, theme, cx));
+        }
+
+        let search_header = search_header.child(result_count);
 
         let mut browse_list = div()
             .flex_1()
@@ -977,6 +986,66 @@ impl App {
             l: 0.55,
             a: 1.0,
         }
+    }
+
+    /// The row of managers a search can be narrowed to, one chip each.
+    ///
+    /// With nothing picked every manager answers, so all the chips read as on
+    /// until one is turned off.
+    fn render_manager_filter(
+        &self,
+        searchable: &[String],
+        theme: &theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let asked_for = &self.browse_state.manager_filter;
+        // A pick naming only managers that cannot answer here narrows to
+        // nothing, which the search reads as asking all of them.
+        let narrowed = searchable.iter().any(|id| asked_for.contains(id));
+        let border = theme.border;
+        let text_muted = theme.text_muted;
+        let hover = theme.hover;
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(styles::spacing::XS));
+
+        for adapter_id in searchable {
+            let asking = !narrowed || asked_for.contains(adapter_id);
+            let color = Self::adapter_color(adapter_id);
+            let id = adapter_id.clone();
+            let toggle = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+                app.toggle_search_manager(&id, cx);
+            });
+
+            let chip = div()
+                .id(SharedString::from(format!("browse-filter-{adapter_id}")))
+                .flex_shrink_0()
+                .px(px(styles::spacing::SM))
+                .py(px(styles::spacing::XXS))
+                .rounded(px(styles::radius::FULL))
+                .border_1()
+                .cursor_pointer()
+                .text_size(px(styles::font_size::CAPTION))
+                .on_click(toggle)
+                .child(adapter_id.clone());
+
+            row = row.child(if asking {
+                chip.bg(color.opacity(0.2))
+                    .border_color(color.opacity(0.4))
+                    .text_color(color)
+                    .hover(move |s| s.bg(color.opacity(0.3)))
+            } else {
+                chip.border_color(border)
+                    .text_color(text_muted)
+                    .hover(move |s| s.bg(hover))
+            });
+        }
+
+        row
     }
 
     pub fn adapter_badge(&self, adapter_id: &str, _theme: &theme::Theme) -> Div {

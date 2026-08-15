@@ -288,6 +288,30 @@ pub(crate) fn rank_results(results: &mut [crate::core::package::Package], query:
     });
 }
 
+/// Take a manager in or out of the set a search is narrowed to.
+///
+/// No manager picked and every manager picked both mean the same thing, so the
+/// empty set stands for either. A pick naming a manager that does not work in
+/// this scope is dropped before anything else is decided.
+pub(crate) fn toggle_manager(
+    asked_for: &mut std::collections::HashSet<String>,
+    adapter_id: &str,
+    available: &[String],
+) {
+    asked_for.retain(|id| available.contains(id));
+    if asked_for.is_empty() {
+        asked_for.extend(available.iter().cloned());
+    }
+
+    if !asked_for.remove(adapter_id) {
+        asked_for.insert(adapter_id.to_string());
+    }
+
+    if asked_for.len() == available.len() {
+        asked_for.clear();
+    }
+}
+
 /// How well a name answers a query typed as an abbreviation, or nothing when
 /// the query is not in there at all.
 ///
@@ -477,6 +501,11 @@ pub struct Question {
 /// Window during which a change arriving after one of our own writes is
 /// treated as ours and ignored by the watcher.
 const SELF_WRITE_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// How long typing has to stop before the managers are asked. A search runs a
+/// command per enabled manager, so going out on every keystroke would spawn a
+/// round of them for every letter of the word being typed.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Wait at least this long after a notify event before reloading. Coalesces
 /// the burst that an atomic rename produces and keeps us from racing partial
@@ -735,20 +764,33 @@ impl App {
         let version = self.browse_state.search_debounce_version;
 
         let mode = self.current_mode;
-        let manager_adapters = self.adapters_for(mode);
+        let manager_adapters = self.searching_adapters(mode);
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+                if !Self::search_is_current(&this, version, cx) {
+                    return;
+                }
+
                 let results = crate::tokio_spawn(async move {
+                    // Every manager at once: one that is slow to answer would
+                    // otherwise hold up the ones that are ready.
+                    let mut asking = tokio::task::JoinSet::new();
+                    for adapter in manager_adapters {
+                        let query = query.clone();
+                        asking.spawn(async move {
+                            let id = adapter.info().id.clone();
+                            (id, adapter.search(&query, None, mode).await)
+                        });
+                    }
+
                     let mut results = Vec::new();
-                    for adapter in &manager_adapters {
-                        if adapter.capabilities().can_search {
-                            match adapter.search(&query, None, mode).await {
-                                Ok(pkgs) => results.extend(pkgs),
-                                Err(e) => {
-                                    log::warn!("Search failed for {}: {e}", adapter.info().id)
-                                }
-                            }
+                    while let Some(answered) = asking.join_next().await {
+                        match answered {
+                            Ok((_, Ok(pkgs))) => results.extend(pkgs),
+                            Ok((id, Err(e))) => log::warn!("Search failed for {id}: {e}"),
+                            Err(e) => log::warn!("Search task failed: {e}"),
                         }
                     }
                     rank_results(&mut results, &query);
@@ -773,6 +815,27 @@ impl App {
         .detach();
     }
 
+    /// Whether the search that was queued at `version` is still the newest
+    /// one, or whether another keystroke has since replaced it.
+    fn search_is_current(this: &WeakEntity<Self>, version: u64, cx: &mut gpui::AsyncApp) -> bool {
+        cx.update(|cx| {
+            this.update(cx, |app, _cx| {
+                app.browse_state.search_debounce_version == version
+            })
+            .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Drop whatever a search in flight would have shown, so clearing the box
+    /// does not leave it spinning on an answer nobody is waiting for.
+    pub fn abandon_search(&mut self) {
+        self.browse_state.search_debounce_version += 1;
+        self.browse_state.search_results.clear();
+        self.browse_state.has_searched = false;
+        self.browse_state.loading = false;
+    }
+
     // ---- Business logic stubs ----
 
     /// The adapters that should answer for a scope.
@@ -789,6 +852,56 @@ impl App {
                 self.adapter_manager.is_enabled(&a.info().id) && a.capabilities().works_in(mode)
             })
             .collect()
+    }
+
+    /// The managers a search goes out to: the ones that can answer one here,
+    /// narrowed to what Browse is asking for.
+    ///
+    /// A pick made in one scope can name a manager that does not work in the
+    /// other. Narrowing to nothing would search nowhere, so it is read as not
+    /// having narrowed at all.
+    fn searching_adapters(&self, mode: PackageMode) -> Vec<Arc<dyn Adapter>> {
+        let can_answer: Vec<Arc<dyn Adapter>> = self
+            .adapters_for(mode)
+            .into_iter()
+            .filter(|a| a.capabilities().can_search)
+            .collect();
+
+        let asked_for = &self.browse_state.manager_filter;
+        let narrowed: Vec<Arc<dyn Adapter>> = can_answer
+            .iter()
+            .filter(|a| asked_for.contains(&a.info().id))
+            .cloned()
+            .collect();
+
+        if narrowed.is_empty() {
+            can_answer
+        } else {
+            narrowed
+        }
+    }
+
+    /// Every manager that could answer a search here, whether or not Browse is
+    /// currently asking it.
+    pub(crate) fn searchable_adapter_ids(&self, mode: PackageMode) -> Vec<String> {
+        self.adapters_for(mode)
+            .iter()
+            .filter(|a| a.capabilities().can_search)
+            .map(|a| a.info().id.clone())
+            .collect()
+    }
+
+    /// Take a manager in or out of the search, and search again with it.
+    pub fn toggle_search_manager(&mut self, adapter_id: &str, cx: &mut Context<Self>) {
+        let available = self.searchable_adapter_ids(self.current_mode);
+        toggle_manager(
+            &mut self.browse_state.manager_filter,
+            adapter_id,
+            &available,
+        );
+
+        self.perform_search(cx);
+        cx.notify();
     }
 
     pub fn load_installed(&mut self, cx: &mut Context<Self>) {
@@ -4774,6 +4887,58 @@ mod tests {
     // Deliberately not glob importing the parent: it pulls in gpui's prelude,
     // which shadows the test attribute.
     use super::readable;
+
+    #[test]
+    fn turning_one_manager_off_leaves_the_rest_asking() {
+        use super::toggle_manager;
+        use std::collections::HashSet;
+
+        let available: Vec<String> = ["soar", "pacstall", "am"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut asked_for = HashSet::new();
+
+        toggle_manager(&mut asked_for, "am", &available);
+        assert_eq!(
+            asked_for,
+            HashSet::from(["soar".to_string(), "pacstall".to_string()])
+        );
+
+        toggle_manager(&mut asked_for, "am", &available);
+        assert!(
+            asked_for.is_empty(),
+            "every manager back on is the same as none picked"
+        );
+    }
+
+    #[test]
+    fn turning_off_the_last_manager_asks_all_of_them_again() {
+        use super::toggle_manager;
+        use std::collections::HashSet;
+
+        let available: Vec<String> = ["soar", "pacstall"].iter().map(|s| s.to_string()).collect();
+        let mut asked_for = HashSet::from(["soar".to_string()]);
+
+        toggle_manager(&mut asked_for, "soar", &available);
+        assert!(
+            asked_for.is_empty(),
+            "searching nowhere is no use, so the choice resets"
+        );
+    }
+
+    #[test]
+    fn a_pick_from_another_scope_is_dropped_before_toggling() {
+        use super::toggle_manager;
+        use std::collections::HashSet;
+
+        // flatpak answered in the scope this was picked in, but not in this one.
+        let available: Vec<String> = ["soar", "pacstall"].iter().map(|s| s.to_string()).collect();
+        let mut asked_for = HashSet::from(["flatpak".to_string()]);
+
+        toggle_manager(&mut asked_for, "pacstall", &available);
+        assert_eq!(asked_for, HashSet::from(["soar".to_string()]));
+    }
 
     #[test]
     fn results_are_ordered_by_how_well_they_answer_the_query() {
