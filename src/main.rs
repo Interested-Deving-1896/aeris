@@ -49,6 +49,7 @@ fn main() {
         // offers none, so the window came back with nothing drawn and no way
         // to move, resize or close it.
         let options = WindowOptions {
+            app_id: Some(app::APP_ID.into()),
             window_min_size: Some(size(px(900.0), px(600.0))),
             window_decorations: Some(WindowDecorations::Client),
             ..Default::default()

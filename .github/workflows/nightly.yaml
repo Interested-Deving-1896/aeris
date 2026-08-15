@@ -157,8 +157,10 @@ jobs:
       - name: Pack with onelf
         shell: bash
         run: |
-          mkdir -p AppDir/bin
+          mkdir -p AppDir/bin AppDir/.onelf/icons AppDir/.onelf/desktop
           cp target/release/aeris AppDir/bin/aeris
+          cp assets/aeris.svg AppDir/.onelf/icons/default.svg
+          cp assets/aeris.desktop AppDir/.onelf/desktop/default.desktop
           cp onelf.toml AppDir/onelf.toml
           sed -i "s/^version = .*/version = \"${{ steps.version.outputs.version }}\"/" AppDir/onelf.toml
           ./onelf build AppDir

@@ -1,7 +1,29 @@
-# aeris
+<div align="center">
 
-**Manages your package managers.** A desktop front end for the ones you
-already have, built with Rust and [GPUI](https://gpui.rs).
+[crates-shield]: https://img.shields.io/crates/v/aeris
+[crates-url]: https://crates.io/crates/aeris
+[release-shield]: https://img.shields.io/github/v/release/pkgforge/aeris?label=release
+[release-url]: https://github.com/pkgforge/aeris/releases/latest
+[downloads-shield]: https://img.shields.io/github/downloads/pkgforge/aeris/total?label=downloads
+[downloads-url]: https://github.com/pkgforge/aeris/releases
+[license-shield]: https://img.shields.io/github/license/pkgforge/aeris.svg
+[license-url]: https://github.com/pkgforge/aeris/blob/main/LICENSE
+
+<img src="assets/aeris.svg" alt="aeris" width="128" height="128">
+
+# Aeris
+
+[![Release][release-shield]][release-url]
+[![Crates.io][crates-shield]][crates-url]
+[![Downloads][downloads-shield]][downloads-url]
+[![License: MIT][license-shield]][license-url]
+
+**Manages your package managers.**
+
+A desktop front end for the ones you already have,
+built with Rust and [GPUI](https://gpui.rs).
+
+</div>
 
 ## Overview
 

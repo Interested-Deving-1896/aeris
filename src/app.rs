@@ -29,6 +29,11 @@ pub fn bind_app_keys(cx: &mut gpui::App) {
 
 pub const APP_NAME: &str = "Aeris";
 
+/// What the window calls itself to the compositor. A desktop entry naming the
+/// same id is the one a running window belongs to, which is how a launcher
+/// knows to show its icon rather than a blank one.
+pub const APP_ID: &str = "aeris";
+
 /// The manager aeris ships knowing about.
 pub const SOAR_ID: &str = "soar";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");

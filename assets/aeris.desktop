@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Aeris
+GenericName=Package Manager
+Comment=Manages your package managers
+Exec=aeris
+Icon=aeris
+Terminal=false
+Categories=System;PackageManager;
+Keywords=package;packages;install;update;manager;soar;
+StartupWMClass=aeris
