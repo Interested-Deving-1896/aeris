@@ -105,10 +105,13 @@ so on the page rather than failing when pressed.
 Manifests are read from, in order:
 
 ```
-~/.local/share/aeris/adapters
-/usr/local/share/aeris/adapters
+$XDG_DATA_HOME/aeris/adapters      # ~/.local/share/aeris/adapters
+$XDG_DATA_DIRS/aeris/adapters      # /usr/local/share and /usr/share
 ./adapters
 ```
+
+The first is where the Adapters page installs to, so a manifest you install
+outranks one a package put there.
 
 The Adapters page installs them from the registry and checks for newer ones.
 See [pkgforge/aeris-registry](https://github.com/pkgforge/aeris-registry) for

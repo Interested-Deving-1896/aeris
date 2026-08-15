@@ -270,12 +270,18 @@ pub fn load(path: &Path) -> Result<CommandManifest, String> {
 }
 
 /// Where a manifest written by hand is looked for.
+///
+/// The first entry is also where a manifest installed from the registry is
+/// written, so what a person installs always outranks what a package did.
 pub fn search_paths() -> Vec<PathBuf> {
-    vec![
-        crate::xdg::data_home().join("aeris/adapters"),
-        PathBuf::from("/usr/local/share/aeris/adapters"),
-        PathBuf::from("./adapters"),
-    ]
+    let mut paths = vec![crate::xdg::data_home().join("aeris/adapters")];
+    paths.extend(
+        crate::xdg::data_dirs()
+            .into_iter()
+            .map(|dir| dir.join("aeris/adapters")),
+    );
+    paths.push(PathBuf::from("./adapters"));
+    paths
 }
 
 /// Read every manifest found on disk, keeping the first of any repeated id.
