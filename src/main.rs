@@ -55,7 +55,10 @@ fn main() {
             ..Default::default()
         };
 
-        cx.open_window(options, |window, cx| cx.new(|cx| App::new(window, cx)))
-            .unwrap();
+        cx.open_window(options, |window, cx| {
+            window.set_window_title(app::APP_NAME);
+            cx.new(|cx| App::new(window, cx))
+        })
+        .unwrap();
     });
 }
