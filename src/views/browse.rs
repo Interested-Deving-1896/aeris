@@ -82,18 +82,31 @@ impl App {
         let syncing = self.adapter_view.syncing.is_some();
         let sync_label = if syncing { "Syncing..." } else { "Sync" };
 
+        // Only worth offering a choice when there is one to make.
+        let searchable = self.searchable_adapter_ids(self.current_mode);
+        let mut narrowing = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(styles::spacing::MD));
+        if searchable.len() > 1 {
+            narrowing = narrowing.child(self.render_manager_filter(&searchable, theme, cx));
+        }
+        narrowing = narrowing.child(
+            div()
+                .text_size(px(styles::font_size::SMALL))
+                .text_color(text_muted)
+                .child(result_count_text),
+        );
+
         let result_count = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .w_full()
-            .child(
-                div()
-                    .text_size(px(styles::font_size::SMALL))
-                    .text_color(text_muted)
-                    .child(result_count_text),
-            )
+            .child(narrowing)
             .child(
                 div()
                     .id("browse-sync")
@@ -163,7 +176,7 @@ impl App {
         // Build the browse list
         // The search box and what it found stay put while the results move,
         // so the box is always there to type in.
-        let mut search_header = div()
+        let search_header = div()
             .flex_shrink_0()
             .w_full()
             .px(px(styles::spacing::XL))
@@ -172,15 +185,8 @@ impl App {
             .flex()
             .flex_col()
             .gap(px(styles::spacing::SM))
-            .child(search_bar);
-
-        // Only worth offering a choice when there is one to make.
-        let searchable = self.searchable_adapter_ids(self.current_mode);
-        if searchable.len() > 1 {
-            search_header = search_header.child(self.render_manager_filter(&searchable, theme, cx));
-        }
-
-        let search_header = search_header.child(result_count);
+            .child(search_bar)
+            .child(result_count);
 
         let mut browse_list = div()
             .flex_1()
