@@ -43,6 +43,12 @@ impl App {
         let hover = theme.hover;
         let danger = theme.danger;
 
+        // Browse says which results are already held, which needs the list of
+        // what is held even when Installed has not been opened.
+        if !self.installed_state.loaded && !self.installed_state.loading {
+            self.load_installed(cx);
+        }
+
         // Sync search query from input entity
         let current_query = self.search_input.read(cx).content().to_string();
         if current_query != self.browse_state.search_query {
@@ -310,6 +316,25 @@ impl App {
         }
     }
 
+    /// Whether a package a search answered with is one already held.
+    ///
+    /// Asking the installed list rather than taking the search's word for it:
+    /// a manager may not report what it already has, and soar answers `false`
+    /// for a package installed under metadata that has since changed.
+    fn is_held(&self, pkg: &Package) -> bool {
+        use crate::core::adapter::package_key;
+
+        pkg.installed
+            || self
+                .installed_state
+                .held
+                .contains(&package_key(&pkg.adapter_id, &pkg.id))
+            || self
+                .installed_state
+                .held
+                .contains(&package_key(&pkg.adapter_id, &pkg.name))
+    }
+
     fn render_package_card(
         &self,
         pkg: &Package,
@@ -420,7 +445,7 @@ impl App {
                 .font_weight(FontWeight::MEDIUM)
                 .child("Update Available")
                 .into_any_element()
-        } else if pkg.installed {
+        } else if self.is_held(pkg) {
             div()
                 .px(px(10.0))
                 .py(px(styles::spacing::XXS))
@@ -437,17 +462,7 @@ impl App {
             let label = pkg_status
                 .map(|s| s.label())
                 .unwrap_or_else(|| "Installing...".into());
-            div()
-                .px(px(10.0))
-                .py(px(styles::spacing::XXS))
-                .rounded(px(styles::radius::SM))
-                .bg(primary.opacity(0.2))
-                .border_1()
-                .border_color(primary.opacity(0.4))
-                .text_size(px(styles::font_size::CAPTION))
-                .text_color(primary)
-                .child(label)
-                .into_any_element()
+            self.status_pill(&pkey, label, theme, cx)
         } else if !can_install {
             // Offering a button the manager has no command for would only fail
             // once it was pressed.

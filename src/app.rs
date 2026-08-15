@@ -289,6 +289,35 @@ pub(crate) fn rank_results(results: &mut [crate::core::package::Package], query:
     });
 }
 
+/// How to recognise a held package in a search answer, by id and by name.
+///
+/// A package installed under metadata that has since changed keeps the id it
+/// was installed with, which a search for it today will not answer with. The
+/// name survives that, so it stands in as well, but only where it names one
+/// package and so cannot be mistaken for another.
+fn held_keys(held: &[crate::core::package::InstalledPackage]) -> std::collections::HashSet<String> {
+    use crate::core::adapter::package_key;
+
+    let mut named: HashMap<String, usize> = HashMap::new();
+    for p in held {
+        *named
+            .entry(package_key(&p.package.adapter_id, &p.package.name))
+            .or_default() += 1;
+    }
+
+    let mut keys = std::collections::HashSet::new();
+    for p in held {
+        keys.insert(package_key(&p.package.adapter_id, &p.package.id));
+
+        let by_name = package_key(&p.package.adapter_id, &p.package.name);
+        if named.get(&by_name) == Some(&1) {
+            keys.insert(by_name);
+        }
+    }
+
+    keys
+}
+
 /// Every package a manager holds, as id to name and version.
 async fn held_by(adapter: &dyn Adapter, mode: PackageMode) -> HashMap<String, (String, String)> {
     adapter
@@ -518,6 +547,15 @@ pub struct App {
     next_toast_id: u64,
     /// Latest BatchProgress event from any adapter: (adapter_id, completed, total, failed).
     batch_progress: Option<(String, u32, u32, u32)>,
+    /// What each manager has written, keyed the same way as progress. Kept
+    /// after the work ends so a failure can still be read back.
+    pub(crate) output_log: HashMap<String, std::collections::VecDeque<String>>,
+    /// The operation whose output is open, if any.
+    pub(crate) open_log: Option<String>,
+    /// Holds the asked text at its end, where the question itself is.
+    question_scroll: ScrollHandle,
+    /// Keeps the open output log on its newest line.
+    pub(crate) output_scroll: ScrollHandle,
     progress_sender: crate::core::adapter::ProgressSender,
     progress_receiver: tokio::sync::mpsc::UnboundedReceiver<crate::core::adapter::ProgressEvent>,
     pub(crate) selected_install_mode: PackageMode,
@@ -583,6 +621,11 @@ const SELF_WRITE_DEBOUNCE: Duration = Duration::from_millis(750);
 /// command per enabled manager, so going out on every keystroke would spawn a
 /// round of them for every letter of the word being typed.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How much of a manager's output is kept per operation. Enough to read back
+/// what went wrong, bounded so a manager that never stops talking cannot grow
+/// without end.
+const OUTPUT_LOG_LINES: usize = 500;
 
 /// Wait at least this long after a notify event before reloading. Coalesces
 /// the burst that an atomic rename produces and keeps us from racing partial
@@ -807,6 +850,10 @@ impl App {
             toasts: Vec::new(),
             next_toast_id: 1,
             batch_progress: None,
+            output_log: HashMap::new(),
+            open_log: None,
+            question_scroll: ScrollHandle::new(),
+            output_scroll: ScrollHandle::new(),
             progress_sender,
             progress_receiver,
             selected_install_mode: default_mode,
@@ -1010,11 +1057,13 @@ impl App {
 
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
+                        app.installed_state.held = held_keys(&all_packages);
                         app.installed_state.packages = all_packages;
                         app.installed_state.loading = false;
                         app.installed_state.loaded = true;
                         app.installed_state.result_version += 1;
                         app.installed_state.updatable_adapters = updatable_adapters;
+
                         cx.notify();
                     })
                 });
@@ -2966,6 +3015,23 @@ impl App {
         self.updates_state.package_progress.insert(key, status);
     }
 
+    /// Start a fresh log for an operation, so what a manager says now is not
+    /// read as following on from the last time it ran.
+    fn start_output_log(&mut self, key: &str) {
+        self.output_log.remove(key);
+    }
+
+    /// Show or hide what a manager wrote for one operation.
+    pub fn toggle_output_log(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.open_log.as_deref() == Some(key) {
+            self.open_log = None;
+        } else {
+            self.open_log = Some(key.to_string());
+            self.output_scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
     /// Forget what a package was doing, in every view that was showing it.
     fn clear_progress(&mut self, key: &str) {
         self.browse_state.package_progress.remove(key);
@@ -3020,6 +3086,7 @@ impl App {
                         asked: question,
                         answer,
                     });
+                    self.question_scroll.scroll_to_bottom();
                     cx.notify();
                 }
                 ProgressEvent::Completed {
@@ -3037,8 +3104,21 @@ impl App {
                     let key = progress_key(&adapter_id, &package_id);
                     self.record_progress(key, OperationStatus::Failed(error));
                 }
-                ProgressEvent::Status { message, .. } => {
-                    log::info!("Progress status: {message}");
+                ProgressEvent::Status {
+                    adapter_id,
+                    package_id,
+                    message,
+                } => {
+                    let key = progress_key(&adapter_id, &package_id);
+                    let lines = self.output_log.entry(key.clone()).or_default();
+                    if lines.len() == OUTPUT_LOG_LINES {
+                        lines.pop_front();
+                    }
+                    lines.push_back(message);
+
+                    if self.open_log.as_deref() == Some(key.as_str()) {
+                        self.output_scroll.scroll_to_bottom();
+                    }
                 }
                 ProgressEvent::BatchProgress {
                     adapter_id,
@@ -3265,8 +3345,10 @@ impl Render for App {
                             )
                             .child(
                                 div()
+                                    .id("question-asked")
+                                    .track_scroll(&self.question_scroll)
                                     .max_h(px(260.0))
-                                    .overflow_hidden()
+                                    .overflow_y_scroll()
                                     .p(px(styles::spacing::SM))
                                     .rounded(px(styles::radius::MD))
                                     .bg(theme.bg)
@@ -4719,6 +4801,7 @@ impl App {
 
         // Stands in until the manager says something of its own.
         let progress_key = crate::core::adapter::manager_progress_key(&adapter_id);
+        self.start_output_log(&progress_key);
         self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
 
@@ -4789,6 +4872,7 @@ impl App {
 
         // Stands in until the manager says something of its own.
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
+        self.start_output_log(&progress_key);
         self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
 
@@ -5092,6 +5176,49 @@ mod tests {
     // Deliberately not glob importing the parent: it pulls in gpui's prelude,
     // which shadows the test attribute.
     use super::readable;
+
+    #[test]
+    fn a_package_installed_under_older_metadata_is_still_recognised() {
+        use super::held_keys;
+        use crate::core::package::{InstalledPackage, Package};
+
+        let held = |id: &str, name: &str| InstalledPackage {
+            installed_at: String::new(),
+            install_size: 0,
+            install_path: None,
+            pinned: false,
+            auto_installed: false,
+            is_healthy: true,
+            profile: None,
+            package: Package {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: "1.0".into(),
+                adapter_id: "soar".into(),
+                description: None,
+                size: None,
+                homepage: None,
+                license: None,
+                installed: true,
+                update_available: false,
+                category: None,
+                tags: Vec::new(),
+                icon_url: None,
+            },
+        };
+
+        // Installed when the metadata still carried a family; searching for it
+        // today answers with the bare name.
+        let keys = held_keys(&[held("widget/widget", "widget")]);
+        assert!(keys.contains("soar:widget/widget"));
+        assert!(keys.contains("soar:widget"));
+
+        // Two of a name is no name at all, so neither stands in for the other.
+        let keys = held_keys(&[held("busybox/cat", "cat"), held("toybox/cat", "cat")]);
+        assert!(keys.contains("soar:busybox/cat"));
+        assert!(keys.contains("soar:toybox/cat"));
+        assert!(!keys.contains("soar:cat"), "a name shared says nothing");
+    }
 
     #[test]
     fn a_wholesale_update_reports_what_actually_moved() {

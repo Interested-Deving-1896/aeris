@@ -3,6 +3,7 @@ pub mod browse;
 pub mod dashboard;
 pub mod installed;
 pub mod manifest;
+pub mod output;
 pub mod settings;
 pub mod titlebar;
 pub mod updates;

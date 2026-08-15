@@ -18,6 +18,12 @@ pub struct InstalledState {
     pub removing: Option<String>,
     pub updating: Option<String>,
     pub updatable_adapters: HashSet<String>,
+    /// Every package held, by [`package_key`]. Browse answers from this rather
+    /// than from what a search claimed, since a manager may not report what it
+    /// already has, or may report it against a build it no longer holds.
+    ///
+    /// [`package_key`]: crate::core::adapter::package_key
+    pub held: HashSet<String>,
     pub selected: HashSet<String>,
     pub package_progress: HashMap<String, OperationStatus>,
 }
@@ -447,18 +453,7 @@ impl App {
                 let label = pkg_status
                     .map(|s| s.label())
                     .unwrap_or_else(|| "Updating...".into());
-                buttons = buttons.child(
-                    div()
-                        .px(px(14.0))
-                        .py(px(styles::spacing::XXS))
-                        .rounded(px(styles::radius::MD))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
-                        .text_size(px(styles::font_size::SMALL))
-                        .text_color(text_muted)
-                        .child(label),
-                );
+                buttons = buttons.child(self.status_pill(&pkey, label, theme, cx));
             } else {
                 let update_pkg = pkg.package.clone();
                 let update_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
@@ -496,16 +491,7 @@ impl App {
             let label = pkg_status
                 .map(|s| s.label())
                 .unwrap_or_else(|| "Removing...".into());
-            buttons = buttons.child(
-                div()
-                    .px(px(14.0))
-                    .py(px(styles::spacing::XXS))
-                    .rounded(px(styles::radius::MD))
-                    .bg(danger.opacity(0.3))
-                    .text_color(text_muted)
-                    .text_size(px(styles::font_size::SMALL))
-                    .child(label),
-            );
+            buttons = buttons.child(self.status_pill(&pkey, label, theme, cx));
         } else if caps.can_remove {
             let remove_pkg = pkg.package.clone();
             let remove_unique_key = unique_key.clone();
@@ -572,8 +558,10 @@ impl App {
             }
         });
 
-        div()
+        let card = div()
             .id(SharedString::from(format!("installed-pkg-{idx}")))
+            .w_full()
+            .min_w_0()
             .px(px(styles::spacing::MD))
             .py(px(styles::spacing::MD))
             .rounded(px(styles::radius::MD))
@@ -589,6 +577,15 @@ impl App {
             .items_center()
             .child(checkbox)
             .child(left)
-            .child(div().flex_shrink_0().child(buttons))
+            .child(div().flex_shrink_0().child(buttons));
+
+        let mut row = div().w_full().min_w_0().flex().flex_col().child(card);
+
+        if self.output_is_open(&pkey) {
+            let titled = format!("{} · {}", pkg.package.adapter_id, pkg.package.name);
+            row = row.child(self.render_output_log(&pkey, &titled, theme, cx));
+        }
+
+        row
     }
 }

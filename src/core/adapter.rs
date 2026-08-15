@@ -28,8 +28,11 @@ pub enum ProgressEvent {
         phase: String,
         progress_percent: f32,
     },
+    /// One line as the manager wrote it, kept whole for the output log.
+    /// [`ProgressEvent::Phase`] carries the shortened form shown on a card.
     Status {
         adapter_id: AdapterId,
+        package_id: String,
         message: String,
     },
     /// The manager stopped to ask something and is waiting on the answer.

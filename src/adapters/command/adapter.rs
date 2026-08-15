@@ -1568,6 +1568,8 @@ impl<'a> Reporter<'a> {
     }
 
     fn report(&self, line: &str) {
+        self.keep(line);
+
         // Most managers have nothing machine readable to say while they work.
         // Their own words are still better than a label that sits at
         // "Starting" until the whole thing is over.
@@ -1582,6 +1584,20 @@ impl<'a> Reporter<'a> {
         if let Some(event) = self.event(&record) {
             let _ = self.progress.sender.send(event);
         }
+    }
+
+    /// Pass the line on as it was written, for the log that keeps every one
+    /// of them rather than only the latest.
+    fn keep(&self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+
+        let _ = self.progress.sender.send(ProgressEvent::Status {
+            adapter_id: self.progress.adapter_id.clone(),
+            package_id: self.progress.package_id.clone(),
+            message: line.to_string(),
+        });
     }
 
     fn report_in_its_own_words(&self, line: &str) {
@@ -1934,6 +1950,20 @@ output = { format = "ndjson" }
         Reporter::new(progress)
     }
 
+    /// The next event that says something about the work. Every line is also
+    /// passed on whole for the output log, which is not what these are about.
+    fn next_meaningful(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>,
+    ) -> Option<ProgressEvent> {
+        while let Ok(event) = receiver.try_recv() {
+            if !matches!(event, ProgressEvent::Status { .. }) {
+                return Some(event);
+            }
+        }
+
+        None
+    }
+
     fn progress(
         format: Format,
     ) -> (
@@ -1965,7 +1995,7 @@ output = { format = "ndjson" }
         reporter_for(&progress)
             .report(r#"{"type":"download_progress","pkg_name":"cat","current":50,"total":100}"#);
 
-        match receiver.try_recv().expect("should have reported") {
+        match next_meaningful(&mut receiver).expect("should have reported") {
             ProgressEvent::Download {
                 package_id,
                 current_bytes,
@@ -1987,7 +2017,7 @@ output = { format = "ndjson" }
         reporter_for(&progress)
             .report(r#"{"type":"installing","pkg_name":"cat","stage":"extracting"}"#);
 
-        match receiver.try_recv().expect("should have reported") {
+        match next_meaningful(&mut receiver).expect("should have reported") {
             ProgressEvent::Phase { package_id, .. } => assert_eq!(package_id, "busybox/cat"),
             other => panic!("reported {other:?}"),
         }
@@ -2003,7 +2033,7 @@ output = { format = "ndjson" }
         reporter_for(&progress)
             .report(r#"{"type":"installing","pkg_name":"cat","stage":"extracting"}"#);
 
-        match receiver.try_recv().expect("should have reported") {
+        match next_meaningful(&mut receiver).expect("should have reported") {
             ProgressEvent::Phase { package_id, .. } => assert_eq!(package_id, "cat"),
             other => panic!("reported {other:?}"),
         }
@@ -2014,7 +2044,7 @@ output = { format = "ndjson" }
         let (progress, mut receiver) = progress(Format::Ndjson);
         reporter_for(&progress).report(r#"{"type":"installing","pkg_name":"cat"}"#);
 
-        match receiver.try_recv().expect("should have reported") {
+        match next_meaningful(&mut receiver).expect("should have reported") {
             ProgressEvent::Phase { phase, .. } => assert_eq!(phase, "installing"),
             other => panic!("reported {other:?}"),
         }
@@ -2062,6 +2092,33 @@ output = { format = "ndjson" }
     }
 
     #[test]
+    fn every_line_is_passed_on_whole_however_little_it_means() {
+        let (progress, mut receiver) = progress(Format::Ndjson);
+        let reporter = reporter_for(&progress);
+
+        // Far longer than a card can show, and not an event at all. The log
+        // wants it anyway, and unshortened.
+        let long = "WARNING: this build is not transparent, and we cannot say what is inside it";
+        reporter.report(long);
+        reporter.report("   ");
+
+        let mut kept = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let ProgressEvent::Status {
+                message,
+                package_id,
+                ..
+            } = event
+            {
+                assert_eq!(package_id, "busybox/cat");
+                kept.push(message);
+            }
+        }
+
+        assert_eq!(kept, [long], "a blank line is not worth keeping");
+    }
+
+    #[test]
     fn a_line_that_is_not_an_event_reports_nothing() {
         let (progress, mut receiver) = progress(Format::Ndjson);
         let reporter = reporter_for(&progress);
@@ -2069,7 +2126,7 @@ output = { format = "ndjson" }
         reporter.report("this is not json");
         reporter.report(r#"{"unrelated":true}"#);
 
-        assert!(receiver.try_recv().is_err());
+        assert!(next_meaningful(&mut receiver).is_none());
     }
 
     #[test]
@@ -2260,7 +2317,7 @@ fields = {{ config = "config", packages_config = "packages_config" }}
         assert!(results[0].success, "{:?}", results[0].error);
 
         let mut reported = Vec::new();
-        while let Ok(event) = receiver.try_recv() {
+        while let Some(event) = next_meaningful(&mut receiver) {
             reported.push(event);
         }
         assert!(

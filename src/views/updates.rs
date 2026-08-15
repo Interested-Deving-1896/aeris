@@ -249,25 +249,15 @@ impl App {
                             .child(format!("{adapter_name} {said}")),
                     );
 
+                let manager_key = crate::core::adapter::manager_progress_key(adapter_id);
                 let working = self
                     .updates_state
                     .package_progress
-                    .get(&crate::core::adapter::manager_progress_key(adapter_id));
+                    .get(&manager_key)
+                    .cloned();
 
                 if let Some(status) = working {
-                    note = note.child(
-                        div()
-                            .flex_shrink_0()
-                            .px(px(14.0))
-                            .py(px(styles::spacing::XS))
-                            .rounded(px(styles::radius::MD))
-                            .bg(surface)
-                            .border_1()
-                            .border_color(border)
-                            .text_size(px(styles::font_size::SMALL))
-                            .text_color(text_muted)
-                            .child(status.label()),
-                    );
+                    note = note.child(self.status_pill(&manager_key, status.label(), theme, cx));
                 } else if *can_update_all && !is_busy {
                     let for_adapter = adapter_id.clone();
                     let named = adapter_name.clone();
@@ -301,6 +291,15 @@ impl App {
                 }
 
                 notes_col = notes_col.child(note);
+
+                if self.output_is_open(&manager_key) {
+                    notes_col = notes_col.child(self.render_output_log(
+                        &manager_key,
+                        adapter_name,
+                        theme,
+                        cx,
+                    ));
+                }
             }
         }
 
@@ -498,17 +497,7 @@ impl App {
             let label = pkg_status
                 .map(|s| s.label())
                 .unwrap_or_else(|| "Updating...".into());
-            div()
-                .px(px(14.0))
-                .py(px(styles::spacing::XS))
-                .rounded(px(styles::radius::MD))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .text_size(px(styles::font_size::SMALL))
-                .text_color(text_muted)
-                .child(label)
-                .into_any_element()
+            self.status_pill(&pkey, label, theme, cx).into_any_element()
         } else {
             let pkg_for_update = update.package.clone();
             let update_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
@@ -593,8 +582,10 @@ impl App {
             }
         });
 
-        div()
+        let card = div()
             .id(SharedString::from(format!("update-pkg-{idx}")))
+            .w_full()
+            .min_w_0()
             .px(px(styles::spacing::LG))
             .py(px(styles::spacing::MD))
             .rounded(px(styles::radius::MD))
@@ -610,6 +601,15 @@ impl App {
             .items_center()
             .child(checkbox)
             .child(left)
-            .child(update_btn)
+            .child(update_btn);
+
+        let mut row = div().w_full().min_w_0().flex().flex_col().child(card);
+
+        if self.output_is_open(&pkey) {
+            let titled = format!("{} · {}", update.package.adapter_id, update.package.name);
+            row = row.child(self.render_output_log(&pkey, &titled, theme, cx));
+        }
+
+        row
     }
 }
