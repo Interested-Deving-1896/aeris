@@ -8,10 +8,16 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 
 /// Where an icon lives, and the bytes it is.
-const ICONS: &[(&str, &[u8])] = &[(
-    "icons/close.svg",
-    include_bytes!("../assets/icons/close.svg"),
-)];
+const ICONS: &[(&str, &[u8])] = &[
+    (
+        "icons/close.svg",
+        include_bytes!("../assets/icons/close.svg"),
+    ),
+    (
+        "icons/package.svg",
+        include_bytes!("../assets/icons/package.svg"),
+    ),
+];
 
 pub struct Assets;
 

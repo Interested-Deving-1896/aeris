@@ -1,6 +1,7 @@
 pub mod message;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -537,6 +538,24 @@ pub struct App {
     /// Where the manager keeps its files, read once at startup. Aeris edits
     /// some of them directly rather than through a command for every field.
     pub(crate) paths: HashMap<String, String>,
+    /// What the desktop entries on disk say about installed packages, which is
+    /// where an icon comes from. Read off the main thread, so it is empty for
+    /// the first frames and every lookup has to allow for that.
+    pub(crate) desktop: Arc<crate::core::desktop::Desktop>,
+    /// Which packages have a published icon, and where those are served from.
+    pub(crate) icon_index: Arc<crate::core::icons::IconIndex>,
+    /// Which icon a package is drawn with, where that is not simply its own.
+    pub(crate) icon_map: Arc<crate::core::icons::IconMap>,
+    /// Icons already on disk, by application. Kept here so drawing a list is
+    /// reading a map rather than asking the filesystem once per row.
+    pub(crate) icons: HashMap<String, PathBuf>,
+    /// Applications still waiting for their icon, in the order they were first
+    /// asked for, so what is at the top of a list is fetched first.
+    pub(crate) icon_queue: VecDeque<String>,
+    /// Every application ever queued, so a row redrawn does not ask twice.
+    pub(crate) icon_asked: HashSet<String>,
+    /// How many icons are being fetched right now.
+    pub(crate) icons_in_flight: usize,
     /// When aeris last wrote the declarative file itself, so the watcher can
     /// tell its own writes from someone else's.
     last_self_write: std::cell::Cell<Option<Instant>>,
@@ -814,6 +833,80 @@ impl App {
         let (manifest_watcher_rx, manifest_watcher) =
             spawn_manifest_watcher(paths.get("packages_config").map(std::path::Path::new));
 
+        let icon_map_source = aeris_config
+            .icon_map_url
+            .clone()
+            .unwrap_or_else(|| crate::core::icons::DEFAULT_ICON_MAP_URL.to_string());
+        let icon_index_source = aeris_config
+            .icon_index_url
+            .clone()
+            .unwrap_or_else(|| crate::core::icons::DEFAULT_ICON_INDEX_URL.to_string());
+
+        // Finding an icon means walking the icon themes, which is slow enough
+        // to be worth keeping off the thread that draws.
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let desktop = cx
+                    .background_executor()
+                    .spawn(async { crate::core::desktop::Desktop::load() })
+                    .await;
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.desktop = Arc::new(desktop);
+                        cx.notify();
+                    })
+                });
+
+                // Which packages have an icon, and which icon each is drawn
+                // with. Both are small; the icons themselves are asked for one
+                // at a time, and only when one is drawn.
+                let (index, map) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let index = crate::core::icons::IconIndex::cached();
+                        let map = crate::core::icons::IconMap::cached();
+                        if !index.is_empty()
+                            && !crate::core::icons::is_stale(crate::core::icons::REFRESH_AFTER)
+                        {
+                            return (index, map);
+                        }
+
+                        let index = match crate::core::icons::refresh_index(&icon_index_source) {
+                            Ok(fresh) => fresh,
+                            Err(e) => {
+                                log::warn!("could not read the icon index: {e}");
+                                index
+                            }
+                        };
+                        let map = match crate::core::icons::refresh_map(&icon_map_source) {
+                            Ok(fresh) => fresh,
+                            Err(e) => {
+                                log::warn!("could not read the icon exceptions: {e}");
+                                map
+                            }
+                        };
+                        (index, map)
+                    })
+                    .await;
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.icon_index = Arc::new(index);
+                        app.icon_map = Arc::new(map);
+                        // Anything looked for before the index landed came up
+                        // empty and was remembered as such, so those answers
+                        // are thrown away rather than kept for the session.
+                        app.icons.clear();
+                        app.icon_asked.clear();
+                        app.icon_queue.clear();
+                        cx.notify();
+                    })
+                });
+            },
+        )
+        .detach();
+
         // Poll for progress events periodically
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -879,6 +972,13 @@ impl App {
             manifest_watcher_rx,
             _manifest_watcher: manifest_watcher,
             manifest_reload_due: None,
+            desktop: Arc::new(crate::core::desktop::Desktop::default()),
+            icon_index: Arc::new(crate::core::icons::IconIndex::default()),
+            icon_map: Arc::new(crate::core::icons::IconMap::default()),
+            icons: HashMap::new(),
+            icon_queue: VecDeque::new(),
+            icon_asked: HashSet::new(),
+            icons_in_flight: 0,
         }
     }
 

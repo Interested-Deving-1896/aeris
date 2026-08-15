@@ -8,6 +8,12 @@ use crate::{
     styles, theme,
 };
 
+/// How large a package's icon is drawn on its card.
+pub const PACKAGE_ICON_SIZE: f32 = 28.0;
+
+/// How many icons may be fetched at once.
+const ICONS_AT_ONCE: usize = 4;
+
 #[derive(Debug, Default)]
 pub struct BrowseState {
     pub search_query: String,
@@ -168,6 +174,12 @@ impl App {
                 .child(div().text_size(px(styles::font_size::BODY)).child(msg))
         } else {
             let results = self.browse_state.search_results.clone();
+            self.want_icons_for(
+                results
+                    .iter()
+                    .map(|pkg| (pkg.adapter_id.as_str(), pkg.name.as_str())),
+                cx,
+            );
             let mut list = div()
                 .flex_1()
                 .flex()
@@ -367,6 +379,7 @@ impl App {
             .min_w_0()
             .gap(px(styles::spacing::SM))
             .items_center()
+            .child(self.package_icon(&pkg.adapter_id, &pkg.name, theme))
             .child(
                 div()
                     .min_w_0()
@@ -1074,6 +1087,116 @@ impl App {
         }
 
         row
+    }
+
+    /// Ask for the icons of everything on show that is a known application.
+    ///
+    /// Queued rather than fetched, in the order the results came back, so what
+    /// is at the top of a list arrives first. Only applications named in the
+    /// map are ever asked for, and each is fetched once and kept, so a long
+    /// list of results costs no more than the applications in it.
+    pub fn want_icons_for<'a>(
+        &mut self,
+        packages: impl Iterator<Item = (&'a str, &'a str)>,
+        cx: &mut Context<Self>,
+    ) {
+        let map = self.icon_map.clone();
+
+        let wanted: Vec<String> = packages
+            .map(|(adapter, name)| map.icon_of(adapter, name))
+            .filter(|icon| !self.icons.contains_key(*icon) && !self.icon_asked.contains(*icon))
+            .map(str::to_string)
+            .collect();
+
+        for application in wanted {
+            self.icon_asked.insert(application.clone());
+
+            match crate::core::icons::cached_icon(&application) {
+                Some(path) => {
+                    self.icons.insert(application, path);
+                }
+                // Only what the index names is ever asked for, so a command
+                // line tool is drawn as a package without a request going out.
+                None if self.icon_index.url_of(&application).is_some()
+                    || crate::core::icons::is_fetchable(&application) =>
+                {
+                    self.icon_queue.push_back(application)
+                }
+                None => {}
+            }
+        }
+
+        self.pump_icon_queue(cx);
+    }
+
+    /// Start as many waiting icons as may be in flight at once.
+    ///
+    /// Capped so a search that turns up hundreds of applications opens a few
+    /// connections rather than hundreds. Whatever does not start now starts as
+    /// each one finishes.
+    fn pump_icon_queue(&mut self, cx: &mut Context<Self>) {
+        while self.icons_in_flight < ICONS_AT_ONCE {
+            let Some(application) = self.icon_queue.pop_front() else {
+                return;
+            };
+            self.icons_in_flight += 1;
+
+            let index = self.icon_index.clone();
+            cx.spawn(
+                async move |this: WeakEntity<App>, cx: &mut gpui::AsyncApp| {
+                    let fetching = application.clone();
+                    let found = cx
+                        .background_executor()
+                        .spawn(async move { crate::core::icons::fetch_icon(&index, &fetching) })
+                        .await;
+
+                    let _ = cx.update(|cx| {
+                        this.update(cx, |app, cx| {
+                            app.icons_in_flight = app.icons_in_flight.saturating_sub(1);
+                            match found {
+                                Ok(path) => {
+                                    app.icons.insert(application, path);
+                                }
+                                // Left in the asked set, so a miss is not retried
+                                // on every frame that redraws the row.
+                                Err(e) => log::debug!("no icon: {e}"),
+                            }
+                            app.pump_icon_queue(cx);
+                            cx.notify();
+                        })
+                    });
+                },
+            )
+            .detach();
+        }
+    }
+
+    /// The icon a package installed, the icon of the application it is, or a
+    /// package drawn in place of either.
+    ///
+    /// The slot is drawn whichever it is, so a list where only some have an
+    /// icon still reads down one edge.
+    pub fn package_icon(&self, adapter_id: &str, name: &str, theme: &theme::Theme) -> AnyElement {
+        let held = self.desktop.find(name).and_then(|entry| entry.icon.clone());
+        let published = || {
+            self.icons
+                .get(self.icon_map.icon_of(adapter_id, name))
+                .cloned()
+        };
+
+        match held.or_else(published) {
+            Some(path) => img(path)
+                .flex_shrink_0()
+                .size(px(PACKAGE_ICON_SIZE))
+                .rounded(px(styles::radius::SM))
+                .into_any_element(),
+            None => svg()
+                .path("icons/package.svg")
+                .flex_shrink_0()
+                .size(px(PACKAGE_ICON_SIZE))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+        }
     }
 
     pub fn adapter_badge(&self, adapter_id: &str, _theme: &theme::Theme) -> Div {

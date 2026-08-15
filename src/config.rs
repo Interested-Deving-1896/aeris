@@ -44,6 +44,12 @@ pub struct AerisConfig {
     /// words soar uses: `always`, `never`, `auto`, or a duration such as
     /// `3h` or `1d`.
     pub registry_sync_interval: Option<String>,
+    /// Where the map from a package's name to the application it is comes
+    /// from. An HTTP(S) URL or a local path. Unset means the published one.
+    pub icon_map_url: Option<String>,
+    /// Where the index of published icons is read from. An HTTP(S) URL or a
+    /// local path. Unset means the published one.
+    pub icon_index_url: Option<String>,
     #[serde(default)]
     pub adapters: HashMap<String, HashMap<String, String>>,
     #[serde(default)]

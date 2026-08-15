@@ -2,6 +2,8 @@ pub mod adapter;
 pub mod adapter_manager;
 pub mod capabilities;
 pub mod config;
+pub mod desktop;
+pub mod icons;
 pub mod package;
 pub mod privilege;
 pub mod profile;

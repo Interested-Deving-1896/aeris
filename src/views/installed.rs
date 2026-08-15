@@ -255,14 +255,19 @@ impl App {
             .flex_row()
             .min_w_0()
             .gap(px(styles::spacing::SM))
-            .items_center()
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(styles::font_size::HEADING))
-                    .child(pkg.package.name.clone()),
-            );
+            .items_center();
+
+        let described = self.desktop.find(&pkg.package.name);
+
+        header = header.child(self.package_icon(&pkg.package.adapter_id, &pkg.package.name, theme));
+
+        header = header.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(styles::font_size::HEADING))
+                .child(pkg.package.name.clone()),
+        );
 
         if !pkg.package.version.is_empty() {
             header = header.child(
@@ -357,8 +362,20 @@ impl App {
             .flex()
             .flex_col()
             .gap(px(styles::spacing::XXS))
-            .child(header)
-            .child(info_row);
+            .child(header);
+
+        if let Some(comment) = described.and_then(|entry| entry.comment.clone()) {
+            left = left.child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_size(px(styles::font_size::SMALL))
+                    .text_color(text_muted)
+                    .child(comment),
+            );
+        }
+
+        left = left.child(info_row);
 
         // Progress bar
         if let Some(progress) = pkg_status.and_then(|s| s.progress()) {
