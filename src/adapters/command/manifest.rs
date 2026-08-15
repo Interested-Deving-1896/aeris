@@ -48,6 +48,9 @@ pub struct CommandManifest {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
+    /// Which revision of this manifest it is, counting from 1. What the
+    /// registry compares to decide an adapter has an update, so a fix to the
+    /// manifest alone still reaches whoever has it.
     #[serde(default)]
     pub version: String,
     #[serde(default)]

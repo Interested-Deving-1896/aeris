@@ -1077,7 +1077,18 @@ impl App {
                 div()
                     .text_size(px(styles::font_size::SMALL))
                     .text_color(text_muted)
-                    .child(format!("v{}", entry.version)),
+                    // Where it stands and where it would go, since the button
+                    // beside it says only what pressing it does. Named the
+                    // same way an installed card names it, or the revision
+                    // reads as the manager's own version.
+                    .child(
+                        match crate::core::registry::installed_plugin_version(&entry.id) {
+                            Some(held) if held != entry.version => {
+                                format!("adapter v{held} \u{2192} v{}", entry.version)
+                            }
+                            _ => format!("adapter v{}", entry.version),
+                        },
+                    ),
             );
 
         // Which registry offered it, worth saying only when more than one did.
@@ -1109,7 +1120,7 @@ impl App {
                 // Already added, so the thing to offer is another look once
                 // the missing command has been installed.
                 (Some(_), _) => "Check again".to_string(),
-                (None, Some(newer)) => format!("Update adapter to {newer}"),
+                (None, Some(_)) => "Update adapter".to_string(),
                 (None, None) => "Install".to_string(),
             };
 
