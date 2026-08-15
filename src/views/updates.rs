@@ -249,7 +249,26 @@ impl App {
                             .child(format!("{adapter_name} {said}")),
                     );
 
-                if *can_update_all && !is_busy {
+                let working = self
+                    .updates_state
+                    .package_progress
+                    .get(&crate::core::adapter::manager_progress_key(adapter_id));
+
+                if let Some(status) = working {
+                    note = note.child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(14.0))
+                            .py(px(styles::spacing::XS))
+                            .rounded(px(styles::radius::MD))
+                            .bg(surface)
+                            .border_1()
+                            .border_color(border)
+                            .text_size(px(styles::font_size::SMALL))
+                            .text_color(text_muted)
+                            .child(status.label()),
+                    );
+                } else if *can_update_all && !is_busy {
                     let for_adapter = adapter_id.clone();
                     let named = adapter_name.clone();
                     let update_everything = cx.listener(move |app, _: &ClickEvent, _window, cx| {

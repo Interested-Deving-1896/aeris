@@ -4716,6 +4716,10 @@ impl App {
 
         self.updates_state.updating = Some(adapter_id.clone());
         let progress_sender = self.progress_sender.clone();
+
+        // Stands in until the manager says something of its own.
+        let progress_key = crate::core::adapter::manager_progress_key(&adapter_id);
+        self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
 
         cx.spawn(
@@ -4738,6 +4742,7 @@ impl App {
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
                         app.updates_state.updating = None;
+                        app.clear_progress(&progress_key);
                         app.updates_state.result_version += 1;
                         app.installed_state.result_version += 1;
                         match result {

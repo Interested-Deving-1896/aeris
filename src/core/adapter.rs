@@ -73,6 +73,12 @@ pub fn progress_key(adapter_id: &str, package_id: &str) -> String {
     package_key(adapter_id, package_id)
 }
 
+/// Where work that names no package reports, such as a manager updating
+/// everything it holds.
+pub fn manager_progress_key(adapter_id: &str) -> String {
+    progress_key(adapter_id, "")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error("Adapter not found: {0}")]
