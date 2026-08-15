@@ -176,6 +176,17 @@ impl App {
                         let Some(pkg) = app.installed_state.packages.get(idx).cloned() else {
                             return div().into_any_element();
                         };
+
+                        // A package installed by a manager that wrote no
+                        // desktop entry still has an icon published for it.
+                        app.want_icons_for(
+                            std::iter::once((
+                                pkg.package.adapter_id.as_str(),
+                                pkg.package.name.as_str(),
+                            )),
+                            cx,
+                        );
+
                         div()
                             .pb(px(styles::spacing::SM))
                             .child(app.render_installed_card(&pkg, idx, &theme, cx))

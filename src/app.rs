@@ -816,15 +816,16 @@ impl App {
 
         // Whichever scope the adapters actually work in. A manager that only
         // ever acts system wide would otherwise have its packages counted and
-        // labelled as the user's.
+        // labelled as the user's, and one that is turned off should have no
+        // say at all: what is left on decides what opens.
         let default_mode = if adapter_manager
-            .list_adapters()
+            .enabled_adapters()
             .iter()
             .any(|info| info.capabilities.supports_user_packages)
         {
             PackageMode::User
         } else if adapter_manager
-            .list_adapters()
+            .enabled_adapters()
             .iter()
             .any(|info| info.capabilities.supports_system_packages)
         {

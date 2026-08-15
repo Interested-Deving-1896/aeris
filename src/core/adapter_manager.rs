@@ -52,6 +52,18 @@ impl AdapterManager {
         self.adapters.values().map(|a| a.info()).collect()
     }
 
+    /// Only the adapters that are actually being driven.
+    ///
+    /// What a turned-off manager can do is not aeris's to speak for, so
+    /// anything deciding how to behave asks this rather than the whole list.
+    pub fn enabled_adapters(&self) -> Vec<&AdapterInfo> {
+        self.adapters
+            .values()
+            .map(|a| a.info())
+            .filter(|info| self.is_enabled(&info.id))
+            .collect()
+    }
+
     pub fn list_adapters_with_status(&self) -> Vec<(AdapterInfo, bool)> {
         self.adapters
             .values()

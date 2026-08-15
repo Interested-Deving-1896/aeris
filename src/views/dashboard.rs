@@ -336,7 +336,7 @@ impl App {
                 .iter()
                 .filter(|p| !p.is_healthy)
                 .count(),
-            adapter_count: self.adapter_manager.list_adapters().len(),
+            adapter_count: self.adapter_manager.enabled_adapters().len(),
         }
     }
 }

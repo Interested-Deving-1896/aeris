@@ -222,6 +222,15 @@ impl App {
                             let Some(update) = app.updates_state.updates.get(idx).cloned() else {
                                 return div().into_any_element();
                             };
+
+                            app.want_icons_for(
+                                std::iter::once((
+                                    update.package.adapter_id.as_str(),
+                                    update.package.name.as_str(),
+                                )),
+                                cx,
+                            );
+
                             div()
                                 .pb(px(styles::spacing::SM))
                                 .child(app.render_update_card(&update, idx, &theme, cx))
