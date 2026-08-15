@@ -352,9 +352,12 @@ fn changed_between(
 /// account is the one taken from what it held either side of the run.
 fn wholesale_outcome(adapter_name: &str, changed: &[String]) -> (ToastLevel, String) {
     match changed {
+        // A manager can do plenty and still move no package, updating itself
+        // among other things, so this says what did not change rather than
+        // that nothing happened.
         [] => (
             ToastLevel::Info,
-            format!("{adapter_name} had nothing to update"),
+            format!("No {adapter_name} package changed"),
         ),
         [..] if changed.len() <= 3 => (
             ToastLevel::Success,
@@ -5240,10 +5243,11 @@ mod tests {
         assert_eq!(level, ToastLevel::Success);
         assert_eq!(said, "Updated firedragon");
 
-        // A run that moved nothing is not an update, however cleanly it ran.
+        // A run that moved no package is not an update of one, however much
+        // the manager did while it ran.
         let (level, said) = wholesale_outcome("AppMan", &changed_between(&before, &before));
         assert_eq!(level, ToastLevel::Info);
-        assert_eq!(said, "AppMan had nothing to update");
+        assert_eq!(said, "No AppMan package changed");
 
         // Too many to name, so they are counted instead.
         let many: Vec<String> = (0..5).map(|n| format!("pkg{n}")).collect();

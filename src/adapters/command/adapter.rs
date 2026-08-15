@@ -1325,6 +1325,11 @@ fn run_on_terminal(
     // here until it is answered.
     let mut unfinished = String::new();
     let mut asked = 0usize;
+    // A terminal echoes what is typed at it, so an answer comes straight back
+    // as though the manager had said it. Whoever answered has seen it already,
+    // and reporting it would leave their own words sitting on the card as the
+    // last thing that happened.
+    let mut echoed: Option<String> = None;
 
     loop {
         match arriving.recv_timeout(QUIET) {
@@ -1339,6 +1344,11 @@ fn run_on_terminal(
                     } else {
                         line.to_string()
                     };
+
+                    if echoed.as_deref() == Some(line.trim()) {
+                        echoed = None;
+                        continue;
+                    }
 
                     if let Some(reporter) = &reporter {
                         reporter.report(&line);
@@ -1373,6 +1383,7 @@ fn run_on_terminal(
                         printed.push_str(question.trim());
                         printed.push('\n');
                         unfinished.clear();
+                        echoed = Some(answer.trim().to_string()).filter(|a| !a.is_empty());
 
                         if writer.write_all(answer.as_bytes()).is_err() || writer.flush().is_err() {
                             let _ = child.kill();
@@ -2870,6 +2881,15 @@ output = {{ format = "lines" }}
 
         assert!(answering.join().unwrap_or(false), "should have been asked");
         assert!(ran.printed.contains("chose 2"), "{}", ran.printed);
+
+        // The terminal echoes the answer straight back. Kept, it would be
+        // read as the manager's own last word and left sitting on the card.
+        let echoed: Vec<&str> = ran
+            .printed
+            .lines()
+            .filter(|line| line.trim() == "2")
+            .collect();
+        assert!(echoed.is_empty(), "answer was echoed back: {}", ran.printed);
     }
 
     #[test]

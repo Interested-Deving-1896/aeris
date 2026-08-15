@@ -149,9 +149,12 @@ impl App {
             .gap(px(styles::spacing::XS))
             .child(header)
             .child(
+                // Occluded, or the wheel would pass through to the list this
+                // sits in and scroll that instead of the output.
                 div()
                     .id(SharedString::from(format!("output-scroll-{key}")))
                     .track_scroll(&self.output_scroll)
+                    .occlude()
                     .w_full()
                     .min_w_0()
                     .max_h(px(180.0))

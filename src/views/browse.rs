@@ -585,8 +585,10 @@ impl App {
             app.load_package_detail(pkg_clone.clone(), cx);
         });
 
-        div()
+        let card = div()
             .id(SharedString::from(format!("browse-pkg-{idx}")))
+            .w_full()
+            .min_w_0()
             .px(px(styles::spacing::MD))
             .py(px(styles::spacing::MD))
             .rounded(px(styles::radius::MD))
@@ -596,7 +598,16 @@ impl App {
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
             .on_click(card_listener)
-            .child(card_content)
+            .child(card_content);
+
+        let mut row = div().w_full().min_w_0().flex().flex_col().child(card);
+
+        if self.output_is_open(&pkey) {
+            let titled = format!("{} · {}", pkg.adapter_id, pkg.name);
+            row = row.child(self.render_output_log(&pkey, &titled, theme, cx));
+        }
+
+        row
     }
 
     fn render_detail_panel(
