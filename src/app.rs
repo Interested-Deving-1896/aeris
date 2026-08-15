@@ -289,6 +289,33 @@ pub(crate) fn rank_results(results: &mut [crate::core::package::Package], query:
     });
 }
 
+/// The version a manager holds for a package right now, or nothing when it
+/// cannot say.
+async fn version_of(adapter: &dyn Adapter, package_id: &str, mode: PackageMode) -> Option<String> {
+    adapter
+        .list_installed(mode)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|installed| installed.package.id == package_id)
+        .map(|installed| installed.package.version)
+}
+
+/// What to say once an update has run without complaining.
+///
+/// Exiting cleanly is not the same as having changed anything: a manager can
+/// find nothing to do, and one told to update everything was never asked
+/// about this package in particular. So the versions before and after settle
+/// it rather than the exit alone.
+fn update_outcome(pkg_name: &str, was: &str, now: Option<String>) -> (ToastLevel, String) {
+    match now {
+        Some(now) if now == was => (ToastLevel::Info, format!("{pkg_name} is already at {now}")),
+        Some(now) => (ToastLevel::Success, format!("Updated {pkg_name} to {now}")),
+        // It ran, and the manager will not say what it holds now.
+        None => (ToastLevel::Info, format!("Finished updating {pkg_name}")),
+    }
+}
+
 /// Take a manager in or out of the set a search is narrowed to.
 ///
 /// No manager picked and every manager picked both mean the same thing, so the
@@ -4623,10 +4650,24 @@ impl App {
         self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
 
+        let pkg_id = pkg.id.clone();
+        let was = pkg.version.clone();
+
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = crate::tokio_spawn(async move {
-                    adapter.update(&[pkg], Some(progress_sender), mode).await
+                    let outcome = adapter.update(&[pkg], Some(progress_sender), mode).await;
+
+                    // What the manager holds now that it is done. A command
+                    // that ran without complaining has not necessarily
+                    // changed anything, and one told to update everything
+                    // never said which package it meant.
+                    let now = match &outcome {
+                        Ok(_) => version_of(adapter.as_ref(), &pkg_id, mode).await,
+                        Err(_) => None,
+                    };
+
+                    (outcome, now)
                 })
                 .await;
 
@@ -4638,15 +4679,17 @@ impl App {
                         app.updates_state.result_version += 1;
                         app.installed_state.result_version += 1;
                         match result {
-                            Ok(Ok(results)) => match failure_among(&results) {
+                            Ok((Ok(results), now)) => match failure_among(&results) {
                                 Some(why) => app.add_toast(
                                     ToastLevel::Error,
                                     format!("Failed to update {pkg_name}. {why}"),
                                 ),
-                                None => app
-                                    .add_toast(ToastLevel::Success, format!("Updated {pkg_name}")),
+                                None => {
+                                    let (level, said) = update_outcome(&pkg_name, &was, now);
+                                    app.add_toast(level, said);
+                                }
                             },
-                            Ok(Err(e)) => {
+                            Ok((Err(e), _)) => {
                                 app.add_toast(
                                     ToastLevel::Error,
                                     format!("Failed to update {pkg_name}: {e}"),
@@ -4911,6 +4954,25 @@ mod tests {
     // Deliberately not glob importing the parent: it pulls in gpui's prelude,
     // which shadows the test attribute.
     use super::readable;
+
+    #[test]
+    fn an_update_that_changed_nothing_does_not_claim_it_did() {
+        use super::{ToastLevel, update_outcome};
+
+        let (level, said) = update_outcome("firedragon", "12.9.1", Some("12.9.2".into()));
+        assert_eq!(level, ToastLevel::Success);
+        assert_eq!(said, "Updated firedragon to 12.9.2");
+
+        // The manager ran and found nothing to do, which is not an update.
+        let (level, said) = update_outcome("firedragon", "12.9.1", Some("12.9.1".into()));
+        assert_eq!(level, ToastLevel::Info);
+        assert_eq!(said, "firedragon is already at 12.9.1");
+
+        // It will not say what it holds, so neither do we.
+        let (level, said) = update_outcome("firedragon", "12.9.1", None);
+        assert_eq!(level, ToastLevel::Info);
+        assert_eq!(said, "Finished updating firedragon");
+    }
 
     #[test]
     fn turning_one_manager_off_leaves_the_rest_asking() {
