@@ -4,6 +4,10 @@
 [package]
 name = "aeris"
 command = "bin/aeris"
+# System-scope work runs the manager under pkexec or sudo, and a setuid bit
+# does nothing inside a user namespace we made ourselves. Staying in the one
+# aeris was started in costs the modes that need their own.
+needs-setuid = true
 output = "aeris.onelf"
 version = "0.0.0"
 description = "Manages your package managers"
