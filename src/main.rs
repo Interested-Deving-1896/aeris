@@ -1,5 +1,6 @@
 mod adapters;
 mod app;
+mod assets;
 mod components;
 mod config;
 mod core;
@@ -10,7 +11,7 @@ mod views;
 mod xdg;
 
 use app::App;
-use gpui::{AppContext as _, Application, WindowOptions, px, size};
+use gpui::{AppContext as _, Application, WindowDecorations, WindowOptions, px, size};
 
 static TOKIO_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
@@ -39,12 +40,17 @@ fn main() {
         .expect("Failed to create Tokio runtime");
     TOKIO_RUNTIME.set(tokio_rt).expect("Runtime already set");
 
-    Application::new().run(|cx| {
+    Application::new().with_assets(assets::Assets).run(|cx| {
         components::text_input::bind_text_input_keys(cx);
         app::bind_app_keys(cx);
 
+        // Asked for outright, because a compositor offering no decoration
+        // protocol at all is reported as decorating the window itself. GNOME
+        // offers none, so the window came back with nothing drawn and no way
+        // to move, resize or close it.
         let options = WindowOptions {
             window_min_size: Some(size(px(900.0), px(600.0))),
+            window_decorations: Some(WindowDecorations::Client),
             ..Default::default()
         };
 

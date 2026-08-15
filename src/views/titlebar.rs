@@ -12,27 +12,23 @@ use crate::{app::App, styles, theme};
 /// How wide a window edge has to be to be grabbed.
 const GRAB: f32 = 6.0;
 
-/// Which of the three the button is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Control {
-    Minimize,
-    Maximize,
-    Close,
-}
-
-impl Control {
-    fn name(self) -> &'static str {
-        match self {
-            Control::Minimize => "window-minimize",
-            Control::Maximize => "window-maximize",
-            Control::Close => "window-close",
-        }
+/// The pointer that says which way an edge resizes.
+fn cursor_for(edge: ResizeEdge) -> CursorStyle {
+    match edge {
+        ResizeEdge::Top => CursorStyle::ResizeUp,
+        ResizeEdge::Bottom => CursorStyle::ResizeDown,
+        ResizeEdge::Left => CursorStyle::ResizeLeft,
+        ResizeEdge::Right => CursorStyle::ResizeRight,
+        ResizeEdge::TopLeft => CursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight => CursorStyle::ResizeUpRightDownLeft,
+        ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+        ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
     }
 }
 
 impl App {
-    /// The three window controls, or nothing when the compositor draws its
-    /// own. They live in the header rather than in a bar of their own, so an
+    /// The window controls, or nothing when the compositor draws its own.
+    /// They live in the header rather than in a bar of their own, so an
     /// undecorated window costs no extra row.
     pub fn window_controls(
         &self,
@@ -44,16 +40,17 @@ impl App {
             return None;
         }
 
+        // Close alone, the way GNOME lays a titlebar out and what a window
+        // most needs back when the compositor draws none. Minimising and
+        // maximising are the compositor's to offer, and mean nothing at all
+        // on one that tiles.
         Some(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(styles::spacing::XXXS))
                 .ml(px(styles::spacing::SM))
-                .child(self.window_button(Control::Minimize, theme, cx))
-                .child(self.window_button(Control::Maximize, theme, cx))
-                .child(self.window_button(Control::Close, theme, cx)),
+                .child(self.close_button(theme, cx)),
         )
     }
 
@@ -62,56 +59,30 @@ impl App {
         matches!(window.window_decorations(), Decorations::Client { .. })
     }
 
-    /// One of the three window controls.
-    ///
-    /// The dash and the square are drawn rather than written: taken from a
-    /// font they arrive at different weights and sit at different heights,
-    /// which is what makes a hand-drawn titlebar look hand-drawn.
-    fn window_button(
-        &self,
-        control: Control,
-        theme: &theme::Theme,
-        _cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    /// The button that closes the window.
+    fn close_button(&self, theme: &theme::Theme, _cx: &mut Context<Self>) -> Stateful<Div> {
         let hover = theme.hover;
-        let danger = theme.danger;
         let ink = theme.text_muted;
 
-        let mark = match control {
-            Control::Minimize => div().w(px(9.0)).h(px(1.0)).bg(ink),
-            Control::Maximize => div()
-                .size(px(9.0))
-                .border_1()
-                .border_color(ink)
-                .rounded(px(1.0)),
-            // The one mark that cannot be drawn from boxes, since gpui only
-            // rotates svg. Sized to sit at the same weight as the other two.
-            Control::Close => div().text_size(px(12.0)).text_color(ink).child("\u{2715}"),
-        };
-
         div()
-            .id(control.name())
+            .id("window-close")
             .size(px(26.0))
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(styles::radius::SM))
             .cursor_pointer()
-            .hover(move |style| match control {
-                Control::Close => style.bg(danger),
-                _ => style.bg(hover),
-            })
+            .hover(move |style| style.bg(hover))
             // The bar moves the window on mouse down, so a button has to say
             // the press was for it and not for the bar behind it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
-            .on_click(move |_, window, _| match control {
-                Control::Minimize => window.minimize_window(),
-                Control::Maximize => window.zoom_window(),
-                Control::Close => window.remove_window(),
-            })
-            .child(mark)
+            .on_click(|_, window, _| window.remove_window())
+            // Drawn from a vector rather than set from a font: the marks a
+            // font offers arrive at whatever weight it drew them, which is
+            // heavier than a titlebar wants.
+            .child(svg().path("icons/close.svg").size(px(16.0)).text_color(ink))
     }
 
     /// The edges of an undecorated window, so it can still be resized.
@@ -124,7 +95,10 @@ impl App {
         };
 
         let grab = px(GRAB);
-        let mut edges = div().absolute().size_full().occlude();
+        // The frame holding the handles covers the whole window, so it must
+        // let everything through. Only the handles themselves take the mouse,
+        // or the window would have a sheet of glass over it.
+        let mut edges = div().absolute().size_full();
 
         for (edge, tiled) in [
             (ResizeEdge::Top, tiling.top),
@@ -140,7 +114,7 @@ impl App {
                 continue;
             }
 
-            let mut handle = div().absolute();
+            let mut handle = div().absolute().occlude().cursor(cursor_for(edge));
             let corner = px(GRAB * 2.0);
 
             handle = match edge {
