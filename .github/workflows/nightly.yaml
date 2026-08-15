@@ -17,7 +17,41 @@ permissions:
   id-token: write
 
 jobs:
+  check-changes:
+    name: Check for new commits
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Before the tag is removed, since the tag is what says which commit was
+      # last released.
+      - name: Compare HEAD with nightly tag
+        id: check
+        shell: bash
+        run: |
+          # Only the nightly run is worth skipping. Asking for a build, or
+          # pushing the tag by hand, is asking for one whatever changed.
+          if [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch origin tag nightly --no-tags || true
+          released=$(git rev-parse -q --verify 'nightly^{commit}' || true)
+
+          if [ -n "$released" ] && [ "$released" = "$(git rev-parse HEAD)" ]; then
+            echo "No new commits since the last nightly; skipping"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   remove-nightly-tag:
+    needs: check-changes
+    if: ${{ needs.check-changes.outputs.changed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,7 +65,8 @@ jobs:
 
   publish-nightly:
     name: Publish nightly binaries
-    needs: remove-nightly-tag
+    needs: [check-changes, remove-nightly-tag]
+    if: ${{ needs.check-changes.outputs.changed == 'true' }}
     runs-on: ${{ matrix.build.RUNNER }}
     container:
       image: ${{ matrix.build.IMAGE }}
