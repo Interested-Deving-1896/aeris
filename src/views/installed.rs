@@ -160,20 +160,37 @@ impl App {
                 .justify_center()
                 .child(div().text_size(px(styles::font_size::BODY)).child(msg))
         } else {
-            let packages = self.installed_state.packages.clone();
-            let mut list = div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap(px(styles::spacing::SM));
-            for (idx, pkg) in packages.iter().enumerate() {
-                list = list.child(self.render_installed_card(pkg, idx, theme, cx));
+            // Only what is on screen is built, so a machine holding hundreds
+            // of packages costs the same to scroll as one holding ten.
+            let held_count = self.installed_state.packages.len();
+            if self.installed_list_version != self.installed_state.result_version {
+                self.installed_list.reset(held_count);
+                self.installed_list_version = self.installed_state.result_version;
             }
-            list
+
+            let held = cx.entity();
+            let theme = theme.clone();
+            div().flex_1().min_h_0().w_full().child(
+                list(self.installed_list.clone(), move |idx, _window, cx| {
+                    held.update(cx, |app, cx| {
+                        let Some(pkg) = app.installed_state.packages.get(idx).cloned() else {
+                            return div().into_any_element();
+                        };
+                        div()
+                            .pb(px(styles::spacing::SM))
+                            .child(app.render_installed_card(&pkg, idx, &theme, cx))
+                            .into_any_element()
+                    })
+                })
+                .size_full(),
+            )
         };
 
+        // The header stays put: the list below it scrolls itself, and a title
+        // that scrolled away would take the Sync and Refresh buttons with it.
         let mut main_col = div()
             .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::MD))
@@ -207,21 +224,14 @@ impl App {
         }
 
         div()
-            .id("installed-scroll")
             .flex_1()
             .min_h_0()
             .min_w_0()
             .w_full()
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .p(px(styles::spacing::XL))
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .min_w_0()
-                    .child(main_col),
-            )
+            .p(px(styles::spacing::XL))
+            .flex()
+            .flex_col()
+            .child(main_col)
     }
 
     fn render_installed_card(

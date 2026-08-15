@@ -556,6 +556,18 @@ pub struct App {
     pub(crate) icon_asked: HashSet<String>,
     /// How many icons are being fetched right now.
     pub(crate) icons_in_flight: usize,
+    /// What the results list has measured and where it is scrolled to. Held
+    /// here because the list draws only what is on screen, and has to be told
+    /// when the results underneath it change.
+    pub(crate) browse_list: gpui::ListState,
+    /// Which set of results the list was told about.
+    pub(crate) browse_list_version: u64,
+    /// The same, for what is installed.
+    pub(crate) installed_list: gpui::ListState,
+    pub(crate) installed_list_version: u64,
+    /// The same, for what can be updated.
+    pub(crate) updates_list: gpui::ListState,
+    pub(crate) updates_list_version: u64,
     /// When aeris last wrote the declarative file itself, so the watcher can
     /// tell its own writes from someone else's.
     last_self_write: std::cell::Cell<Option<Instant>>,
@@ -979,6 +991,12 @@ impl App {
             icon_queue: VecDeque::new(),
             icon_asked: HashSet::new(),
             icons_in_flight: 0,
+            browse_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
+            browse_list_version: u64::MAX,
+            installed_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
+            installed_list_version: u64::MAX,
+            updates_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.0)),
+            updates_list_version: u64::MAX,
         }
     }
 

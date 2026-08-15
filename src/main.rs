@@ -60,5 +60,14 @@ fn main() {
             cx.new(|cx| App::new(window, cx))
         })
         .unwrap();
+
+        // Aeris is its window. Without saying so, closing it leaves the work
+        // behind it running, still asking for frames of a window that has gone.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
     });
 }

@@ -173,22 +173,39 @@ impl App {
                 .justify_center()
                 .child(div().text_size(px(styles::font_size::BODY)).child(msg))
         } else {
-            let results = self.browse_state.search_results.clone();
-            self.want_icons_for(
-                results
-                    .iter()
-                    .map(|pkg| (pkg.adapter_id.as_str(), pkg.name.as_str())),
-                cx,
-            );
-            let mut list = div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap(px(styles::spacing::SM));
-            for (idx, pkg) in results.iter().enumerate() {
-                list = list.child(self.render_package_card(pkg, idx, theme, cx));
+            // Only what is on screen is built. A search for a common letter
+            // turns up thousands of packages, and drawing them all is what
+            // made scrolling one of them lurch.
+            let found = self.browse_state.search_results.len();
+            if self.browse_list_version != self.browse_state.result_version {
+                self.browse_list.reset(found);
+                self.browse_list_version = self.browse_state.result_version;
             }
-            list
+
+            let held = cx.entity();
+            let theme = theme.clone();
+            div().flex_1().min_h_0().w_full().child(
+                list(self.browse_list.clone(), move |idx, _window, cx| {
+                    held.update(cx, |app, cx| {
+                        let Some(pkg) = app.browse_state.search_results.get(idx).cloned() else {
+                            return div().into_any_element();
+                        };
+
+                        // Asked for as it comes into view, so a long list
+                        // costs the icons somebody actually looked at.
+                        app.want_icons_for(
+                            std::iter::once((pkg.adapter_id.as_str(), pkg.name.as_str())),
+                            cx,
+                        );
+
+                        div()
+                            .pb(px(styles::spacing::SM))
+                            .child(app.render_package_card(&pkg, idx, &theme, cx))
+                            .into_any_element()
+                    })
+                })
+                .size_full(),
+            )
         };
 
         // Build the browse list
@@ -286,24 +303,19 @@ impl App {
             .flex()
             .flex_col()
             .child(search_header)
+            // The results scroll themselves, drawing only what is on screen,
+            // so nothing here may scroll around them.
             .child(
                 div()
-                    .id("browse-scroll")
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .w_full()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .px(px(styles::spacing::XL))
-                            .pb(px(styles::spacing::XL))
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .min_w_0()
-                            .child(browse_list),
-                    ),
+                    .px(px(styles::spacing::XL))
+                    .pb(px(styles::spacing::XL))
+                    .flex()
+                    .flex_col()
+                    .child(browse_list),
             );
 
         // Detail side panel

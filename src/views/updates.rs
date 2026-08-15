@@ -203,13 +203,34 @@ impl App {
                 )
                 .into_any_element()
         } else {
-            let mut cards_col = div().flex().flex_col().gap(px(styles::spacing::SM));
-
-            for (idx, update) in self.updates_state.updates.iter().enumerate() {
-                cards_col = cards_col.child(self.render_update_card(update, idx, theme, cx));
+            // Only what is on screen is built, the same as the other listings.
+            let waiting = self.updates_state.updates.len();
+            if self.updates_list_version != self.updates_state.result_version {
+                self.updates_list.reset(waiting);
+                self.updates_list_version = self.updates_state.result_version;
             }
 
-            cards_col.into_any_element()
+            let held = cx.entity();
+            let theme = theme.clone();
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(
+                    list(self.updates_list.clone(), move |idx, _window, cx| {
+                        held.update(cx, |app, cx| {
+                            let Some(update) = app.updates_state.updates.get(idx).cloned() else {
+                                return div().into_any_element();
+                            };
+                            div()
+                                .pb(px(styles::spacing::SM))
+                                .child(app.render_update_card(&update, idx, &theme, cx))
+                                .into_any_element()
+                        })
+                    })
+                    .size_full(),
+                )
+                .into_any_element()
         };
 
         let mut notes_col = div()
@@ -321,6 +342,8 @@ impl App {
         }
 
         let mut main_col = div()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::LG))
@@ -356,24 +379,19 @@ impl App {
             .flex()
             .flex_col()
             .child(pinned)
+            // The cards scroll themselves, drawing only what is on screen,
+            // so nothing here may scroll around them.
             .child(
                 div()
-                    .id("updates-scroll")
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .w_full()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .px(px(styles::spacing::XL))
-                            .pb(px(styles::spacing::XL))
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .min_w_0()
-                            .child(main_col),
-                    ),
+                    .px(px(styles::spacing::XL))
+                    .pb(px(styles::spacing::XL))
+                    .flex()
+                    .flex_col()
+                    .child(main_col),
             )
     }
 
