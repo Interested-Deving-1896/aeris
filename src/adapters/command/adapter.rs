@@ -1445,17 +1445,20 @@ fn run(
 
     // There is no terminal here, and `dumb` is the name for that. Without it
     // a manager asking a terminal what it can do gets no answer at all, and
-    // elevation makes it worse: sudo hands on `unknown`, which is not a
-    // terminal any more than nothing is.
+    // sudo makes it worse: it hands on `unknown`, which is not a terminal any
+    // more than nothing is. pkexec drops the variable along with the rest of
+    // the environment, leaving it unset, which comes to the same thing.
     base.env("TERM", "dumb");
 
     // Asking through the desktop's own prompt is the only way a window can
     // ask for a password. Without it the manager would sit waiting on a
     // terminal that is not there.
+    let mut elevator = None;
     if elevate {
-        base = crate::core::privilege::PrivilegeManager::new()
-            .prepare_command(PackageMode::System, base)
+        let (raised, asked) = crate::core::privilege::elevated(PackageMode::System, base)
             .map_err(|e| AdapterError::PermissionDenied(e.to_string()))?;
+        base = raised;
+        elevator = asked;
     }
 
     let mut child = base
@@ -1521,6 +1524,15 @@ fn run(
     }
 
     if !status.success() {
+        // A refusal to run at all reads as the manager failing, because its
+        // exit code is whatever the elevator handed back.
+        if let Some(why) =
+            elevator.and_then(|asked| crate::core::privilege::refused(asked, status, &errors))
+        {
+            log::error!("{} was not allowed to run: {why}", program.display());
+            return Err(AdapterError::PermissionDenied(why));
+        }
+
         let said = last_lines(&errors);
         log::error!("{} {} failed: {said}", program.display(), args.join(" "));
         return Err(AdapterError::Other(said));

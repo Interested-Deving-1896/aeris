@@ -88,7 +88,7 @@ pub enum AdapterError {
     NotFound(String),
     #[error("Package not found: {0}")]
     PackageNotFound(String),
-    #[error("Permission denied: {0}")]
+    #[error("{0}")]
     PermissionDenied(String),
     #[error("Network error: {0}")]
     NetworkError(String),
