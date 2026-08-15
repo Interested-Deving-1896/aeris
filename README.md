@@ -48,6 +48,7 @@ from the [adapter registry](https://github.com/pkgforge/aeris-registry).
 - Watch a manager work, in its own words, and answer it when it stops to ask
 - See what a manager holds, what it can update, and what it cannot tell you
 - Add adapters from the registry, refreshed on an interval and offered as updates
+- Read as many registries as you like, your own included, in the order you trust them
 - Declarative manifest view: edit `packages.toml`, preview the diff, and apply
 - Per package detail panel with source, build, and option fields
 
@@ -112,6 +113,66 @@ Manifests are read from, in order:
 The Adapters page installs them from the registry and checks for newer ones.
 See [pkgforge/aeris-registry](https://github.com/pkgforge/aeris-registry) for
 the published manifests and the schema.
+
+A manifest carries its own `version`, counting from one. It is the manifest
+being versioned rather than the manager, so a manifest can be corrected
+without waiting for a release, and a manager can release without every
+manifest claiming to have changed. The Adapters page shows both: the version
+of the manager it found, and the manifest revision driving it.
+
+### Registries
+
+A registry is a `registry.toml` listing manifests and their checksums, served
+over HTTP(S) or read from a local path. Aeris ships knowing about
+[the pkgforge one](https://github.com/pkgforge/aeris-registry) and reads it
+when nothing else is configured.
+
+Anything else you want to drive is a registry of your own. It can sit on a web
+server, on a share, or in a directory on the machine, and needs no
+coordination with pkgforge:
+
+```toml
+registries = [
+  "https://raw.githubusercontent.com/pkgforge/aeris-registry/main/registry.toml",
+  { name = "work", url = "https://packages.example.com/aeris/registry.toml" },
+  "~/dev/my-adapters/registry.toml",
+]
+```
+
+An entry is either a bare URL or a table naming it. A name is only what the
+Settings page calls it; without one, aeris names it after where it is read
+from. The order is the point rather than decoration: where two registries
+offer the same adapter, the one listed first is the one offered, so putting
+your own above the default is how you replace a published manifest.
+
+The Settings page lists them. A row can be renamed, moved up or down, or
+removed, and its Test button reads that registry once to report how many
+adapters it offers or why it could not be read.
+
+## Configuration
+
+Aeris keeps its own settings in `~/.config/aeris/config.toml`, which the
+Settings page writes. Every key is optional and the file need not exist.
+
+```toml
+theme = "system"               # system, light, dark
+startup_view = "dashboard"     # dashboard, browse, installed, updates
+notifications = true
+
+# How long the copy of the registry on disk stays good for. Takes the words
+# soar uses: always, never, auto, or a duration such as 30m, 3h, 1d.
+registry_sync_interval = "3h"
+
+disabled_adapters = ["pacstall"]
+
+registries = [
+  "https://raw.githubusercontent.com/pkgforge/aeris-registry/main/registry.toml",
+]
+```
+
+Only aeris itself is configured here. A setting a manager owns is written to
+that manager's own configuration, which is why the Settings page shows those
+fields as they stand on disk until you override one.
 
 ## Contributing
 
