@@ -1066,6 +1066,12 @@ impl App {
                     .child(format!("v{}", entry.version)),
             );
 
+        // Which registry offered it, worth saying only when more than one did.
+        let header = match self.adapter_view.registry_count > 1 && !entry.source.is_empty() {
+            false => header,
+            true => header.child(self.badge_neutral(&entry.source, theme)),
+        };
+
         let desc = div()
             .text_size(px(styles::font_size::SMALL))
             .text_color(text_muted)

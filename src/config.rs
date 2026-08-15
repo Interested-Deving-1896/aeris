@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AppTheme, View};
+use crate::core::registry::Source;
 
 /// How often to read the registry again when nothing says otherwise.
 const DEFAULT_REGISTRY_SYNC: Duration = Duration::from_secs(3 * 60 * 60);
@@ -35,6 +36,10 @@ pub struct AerisConfig {
     /// path (a bare path or a `file://` URL). Falls back to the built-in
     /// default when unset.
     pub registry_url: Option<String>,
+    /// Every adapter registry to read, in the order they are trusted. Where
+    /// two offer the same adapter, the one named first is the one offered.
+    #[serde(default)]
+    pub registries: Vec<crate::core::registry::Source>,
     /// How long the copy of the registry on disk stays good for. Takes the
     /// words soar uses: `always`, `never`, `auto`, or a duration such as
     /// `3h` or `1d`.
@@ -84,6 +89,29 @@ impl AerisConfig {
             "never" => None,
             "auto" => Some(DEFAULT_REGISTRY_SYNC),
             written => parse_interval(written).or(Some(DEFAULT_REGISTRY_SYNC)),
+        }
+    }
+
+    /// The registries to read, in the order they are trusted.
+    ///
+    /// `registries` if it names any, else the single `registry_url` that came
+    /// before it, else the one aeris ships knowing about.
+    pub fn registries(&self) -> Vec<Source> {
+        let named: Vec<Source> = self
+            .registries
+            .iter()
+            .filter(|source| !source.url().trim().is_empty())
+            .cloned()
+            .collect();
+        if !named.is_empty() {
+            return named;
+        }
+
+        match self.registry_url.as_deref().map(str::trim) {
+            Some(one) if !one.is_empty() => vec![Source::Url(one.to_string())],
+            _ => vec![Source::Url(
+                crate::core::registry::DEFAULT_REGISTRY_URL.to_string(),
+            )],
         }
     }
 

@@ -501,6 +501,8 @@ pub(crate) fn active_bin_path(paths: &HashMap<String, String>) -> Option<std::pa
 #[derive(Default)]
 pub struct AdapterViewState {
     pub registry_plugins: Vec<PluginEntry>,
+    /// How many registries the listing was drawn from.
+    pub registry_count: usize,
     pub registry_loading: bool,
     pub registry_error: Option<String>,
     /// When the listing on show was read, so the page can say how old it is.
@@ -2213,9 +2215,12 @@ impl App {
         }
         self.adapter_view.registry_considered = true;
 
-        if let Some((registry, read_at)) = crate::core::registry::cached_registry() {
-            self.adapter_view.registry_plugins = registry.plugins;
-            self.adapter_view.registry_read_at = Some(read_at);
+        let sources = self.aeris_config.registries();
+        self.adapter_view.registry_count = sources.len();
+        let (offered, read_at) = crate::core::registry::cached_all(&sources);
+        if !offered.is_empty() {
+            self.adapter_view.registry_plugins = offered;
+            self.adapter_view.registry_read_at = read_at;
         }
 
         // `never` leaves reading it again to whoever asks.
@@ -2223,7 +2228,7 @@ impl App {
             return;
         };
 
-        if crate::core::registry::cache_is_stale(within) {
+        if crate::core::registry::any_stale(&sources, within) {
             self.fetch_registry(cx);
         }
     }
@@ -2232,23 +2237,23 @@ impl App {
         self.adapter_view.registry_loading = true;
         self.adapter_view.registry_error = None;
 
-        let registry_url = self.aeris_config.registry_url.clone();
+        let sources = self.aeris_config.registries();
+        self.adapter_view.registry_count = sources.len();
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = crate::core::registry::fetch_registry(registry_url.as_deref());
+                let (offered, errors) = crate::core::registry::fetch_all(&sources);
 
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
-                        match result {
-                            Ok(registry) => {
-                                app.adapter_view.registry_plugins = registry.plugins;
-                                app.adapter_view.registry_read_at =
-                                    Some(std::time::SystemTime::now());
-                            }
-                            Err(e) => {
-                                app.adapter_view.registry_error = Some(e);
-                            }
+                        // A registry that failed is named, and whatever the
+                        // others offered is still shown.
+                        if !offered.is_empty() || errors.is_empty() {
+                            app.adapter_view.registry_plugins = offered;
+                            app.adapter_view.registry_read_at = Some(std::time::SystemTime::now());
+                        }
+                        if !errors.is_empty() {
+                            app.adapter_view.registry_error = Some(errors.join("; "));
                         }
                         app.adapter_view.registry_loading = false;
                         cx.notify();
@@ -2367,12 +2372,14 @@ impl App {
         self.settings_state.registry_test_error = None;
         self.settings_state.registry_test_count = None;
 
-        let url = self.settings_state.registry_url.trim().to_string();
-        let url = if url.is_empty() { None } else { Some(url) };
+        let url = match self.settings_state.registry_url.trim() {
+            "" => crate::core::registry::DEFAULT_REGISTRY_URL.to_string(),
+            named => named.to_string(),
+        };
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = crate::core::registry::fetch_registry(url.as_deref());
+                let result = crate::core::registry::fetch_registry(&url);
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
                         app.settings_state.registry_testing = false;
