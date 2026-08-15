@@ -34,19 +34,33 @@ const ICON_EXTENSIONS: [&str; 2] = ["svg", "png"];
 /// Suffixes that say how a package was built rather than what it is, so a
 /// package carrying one is drawn with the icon of the program it packages.
 ///
-/// Only ever a fallback: a package with an icon of its own keeps it. Suffixes
-/// that mark a different build, such as `-git` or `-nightly`, are deliberately
-/// absent, since those are often a different program to look at.
-const PACKAGING_SUFFIXES: [&str; 5] = ["-bin", "-deb", "-app", "-appimage", "-static"];
+/// Only ever a fallback: a package with an icon of its own keeps it. `-git`
+/// and `-stable` belong here because building from a repository, or naming the
+/// channel a project already draws its icon for, changes nothing about what a
+/// program is. What is absent is anything branded apart, such as `-nightly` or
+/// `-beta`, where the same program really is drawn differently.
+const PACKAGING_SUFFIXES: [&str; 7] = [
+    "-bin",
+    "-deb",
+    "-app",
+    "-appimage",
+    "-static",
+    "-git",
+    "-stable",
+];
 
 /// What a package's icon might be called, the name it goes by first.
+///
+/// Suffixes come off one after another, since a package can carry more than
+/// one of them: `zed-editor-stable-bin` is `zed-editor` built a particular way
+/// from a particular channel.
 fn named(icon: &str) -> impl Iterator<Item = &str> {
-    std::iter::once(icon).chain(
+    std::iter::successors(Some(icon), |name| {
         PACKAGING_SUFFIXES
             .iter()
-            .filter_map(move |suffix| icon.strip_suffix(suffix))
-            .filter(|trimmed| !trimmed.is_empty()),
-    )
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .filter(|shorter| !shorter.is_empty())
+    })
 }
 
 /// How long the index and the exceptions stay good for. A name means the same
@@ -390,9 +404,33 @@ mod tests {
         );
         assert_eq!(index.file_name("krita-deb").as_deref(), Some("krita.png"));
         assert_eq!(
-            index.url_of("krita-git"),
+            index.url_of("krita-git").as_deref(),
+            Some("https://example.invalid/icons/krita.png"),
+            "built from a repository, still the same program"
+        );
+        assert_eq!(
+            index.url_of("krita-nightly"),
             None,
-            "a suffix marking a different build is left alone"
+            "a channel a project brands apart is left alone"
+        );
+    }
+
+    #[test]
+    fn more_than_one_suffix_comes_off() {
+        let index: IconIndex = toml::from_str(
+            r#"
+            base = "https://example.invalid/icons"
+
+            [icons]
+            zed-editor = "svg"
+            "#,
+        )
+        .expect("the sample should read");
+
+        assert_eq!(
+            index.file_name("zed-editor-stable-bin").as_deref(),
+            Some("zed-editor.svg"),
+            "a channel and a way of building are both only how it was packaged"
         );
     }
 
