@@ -437,7 +437,17 @@ impl CommandAdapter {
         let op = self.op(op_name)?;
 
         if !takes_a_package(op) {
-            self.run(op_name, Values::new(), progress, String::new(), mode)
+            // An op naming no package still acts for whoever was asked about,
+            // and it is their card waiting to hear something. Addressed to
+            // nobody, everything it says would be filed under no package at
+            // all and shown nowhere. Only one package can be spoken for, so a
+            // batch still goes unaddressed.
+            let addressed = match packages {
+                [only] => only.id.clone(),
+                _ => String::new(),
+            };
+
+            self.run(op_name, Values::new(), progress, addressed, mode)
                 .await?;
             return Ok(Vec::new());
         }

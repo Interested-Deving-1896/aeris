@@ -115,8 +115,10 @@ pub enum OperationStatus {
         current: u64,
         total: u64,
     },
-    /// What the manager says it is doing, in its own words.
-    Installing(String),
+    /// What the manager says it is doing, in its own words. Shown as it came,
+    /// since a manager updating a package does not want its own line dressed
+    /// up as an install.
+    Working(String),
     Completed,
     Failed(String),
 }
@@ -135,7 +137,7 @@ impl OperationStatus {
                     "Downloading...".into()
                 }
             }
-            OperationStatus::Installing(phase) => format!("Installing ({phase})..."),
+            OperationStatus::Working(phase) => phase.clone(),
             OperationStatus::Completed => "Completed".into(),
             OperationStatus::Failed(e) => format!("Failed: {e}"),
         }
@@ -161,7 +163,6 @@ impl OperationStatus {
                 let percent = (*current as f64 / *total as f64 * 100.0) as u64;
                 format!("Downloading {percent}%")
             }
-            OperationStatus::Installing(phase) => phase.clone(),
             OperationStatus::Failed(_) => "Failed".into(),
             other => other.label(),
         }
@@ -2876,6 +2877,13 @@ impl App {
         self.updates_state.package_progress.insert(key, status);
     }
 
+    /// Forget what a package was doing, in every view that was showing it.
+    fn clear_progress(&mut self, key: &str) {
+        self.browse_state.package_progress.remove(key);
+        self.installed_state.package_progress.remove(key);
+        self.updates_state.package_progress.remove(key);
+    }
+
     fn drain_progress(&mut self, cx: &mut Context<Self>) {
         use crate::core::adapter::{ProgressEvent, progress_key};
 
@@ -2907,7 +2915,7 @@ impl App {
                     ..
                 } => {
                     let key = progress_key(&adapter_id, &package_id);
-                    self.record_progress(key, OperationStatus::Installing(readable(&phase)));
+                    self.record_progress(key, OperationStatus::Working(readable(&phase)));
                 }
                 ProgressEvent::Asked {
                     adapter_id,
@@ -4594,54 +4602,70 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let pkg_name = pkg.name.clone();
-        self.updates_state.updating = Some(pkg.id.clone());
         let progress_sender = self.progress_sender.clone();
-        let adapter = self.adapter_manager.get_adapter(&pkg.adapter_id);
+        let Some(adapter) = self.adapter_manager.get_adapter(&pkg.adapter_id) else {
+            self.add_toast(
+                ToastLevel::Error,
+                format!("Cannot update {pkg_name}: {} is not loaded", pkg.adapter_id),
+            );
+            return;
+        };
 
-        if let Some(adapter) = adapter {
-            cx.spawn(
-                async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                    let result = crate::tokio_spawn(async move {
-                        adapter.update(&[pkg], Some(progress_sender), mode).await
-                    })
-                    .await;
+        // Both views show the same package, and either can be the one the
+        // button was pressed in.
+        self.updates_state.updating = Some(pkg.id.clone());
+        self.installed_state.updating = Some(pkg.id.clone());
 
-                    let _ = cx.update(|cx| {
-                        this.update(cx, |app, cx| {
-                            app.updates_state.updating = None;
-                            app.updates_state.result_version += 1;
-                            match result {
-                                Ok(Ok(results)) => match failure_among(&results) {
-                                    Some(why) => app.add_toast(
-                                        ToastLevel::Error,
-                                        format!("Failed to update {pkg_name}. {why}"),
-                                    ),
-                                    None => app.add_toast(
-                                        ToastLevel::Success,
-                                        format!("Updated {pkg_name}"),
-                                    ),
-                                },
-                                Ok(Err(e)) => {
-                                    app.add_toast(
-                                        ToastLevel::Error,
-                                        format!("Failed to update {pkg_name}: {e}"),
-                                    );
-                                }
-                                Err(e) => {
-                                    app.add_toast(
-                                        ToastLevel::Error,
-                                        format!("Failed to update {pkg_name}: {e}"),
-                                    );
-                                }
+        // Stand in until the manager says something itself. A manager that
+        // reports nothing until it is done would otherwise leave the card
+        // looking untouched for the whole update.
+        let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
+        self.record_progress(progress_key.clone(), OperationStatus::Starting);
+        cx.notify();
+
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = crate::tokio_spawn(async move {
+                    adapter.update(&[pkg], Some(progress_sender), mode).await
+                })
+                .await;
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.updates_state.updating = None;
+                        app.installed_state.updating = None;
+                        app.clear_progress(&progress_key);
+                        app.updates_state.result_version += 1;
+                        app.installed_state.result_version += 1;
+                        match result {
+                            Ok(Ok(results)) => match failure_among(&results) {
+                                Some(why) => app.add_toast(
+                                    ToastLevel::Error,
+                                    format!("Failed to update {pkg_name}. {why}"),
+                                ),
+                                None => app
+                                    .add_toast(ToastLevel::Success, format!("Updated {pkg_name}")),
+                            },
+                            Ok(Err(e)) => {
+                                app.add_toast(
+                                    ToastLevel::Error,
+                                    format!("Failed to update {pkg_name}: {e}"),
+                                );
                             }
-                            app.installed_state.loaded = false;
-                            cx.notify();
-                        })
-                    });
-                },
-            )
-            .detach();
-        }
+                            Err(e) => {
+                                app.add_toast(
+                                    ToastLevel::Error,
+                                    format!("Failed to update {pkg_name}: {e}"),
+                                );
+                            }
+                        }
+                        app.installed_state.loaded = false;
+                        cx.notify();
+                    })
+                });
+            },
+        )
+        .detach();
     }
 
     fn batch_install(
@@ -5089,7 +5113,7 @@ mod tests {
             }
             .is_finished()
         );
-        assert!(!OperationStatus::Installing("extracting".into()).is_finished());
+        assert!(!OperationStatus::Working("extracting".into()).is_finished());
     }
 
     #[test]

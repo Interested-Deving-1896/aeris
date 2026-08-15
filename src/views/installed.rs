@@ -469,18 +469,23 @@ impl App {
                     ));
                     cx.notify();
                 });
+                // Secondary, and asking rather than telling: this manager
+                // cannot say whether there is an update, so a primary Update
+                // would claim one is waiting when nobody knows that.
                 buttons = buttons.child(
                     div()
                         .id(SharedString::from(format!("update-installed-{idx}")))
                         .px(px(14.0))
                         .py(px(styles::spacing::XXS))
                         .rounded(px(styles::radius::MD))
-                        .bg(primary)
-                        .text_color(gpui::white())
+                        .bg(surface)
+                        .border_1()
+                        .border_color(border)
                         .text_size(px(styles::font_size::SMALL))
                         .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
                         .on_click(update_listener)
-                        .child("Update"),
+                        .child("Check for update"),
                 );
             }
         }
