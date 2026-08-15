@@ -6,6 +6,13 @@ pub enum ConfirmAction {
     Remove(Package, PackageMode),
     Update(Package, PackageMode),
     UpdateAll(PackageMode),
+    /// Update everything one manager holds, for a manager that cannot be
+    /// pointed at a single package. Carries its id and name.
+    UpdateEverythingIn {
+        adapter_id: String,
+        adapter_name: String,
+        mode: PackageMode,
+    },
     BatchInstall(Vec<Package>, PackageMode),
     BatchRemove(Vec<Package>, PackageMode),
     BatchUpdate(Vec<Package>, PackageMode),

@@ -289,6 +289,55 @@ pub(crate) fn rank_results(results: &mut [crate::core::package::Package], query:
     });
 }
 
+/// Every package a manager holds, as id to name and version.
+async fn held_by(adapter: &dyn Adapter, mode: PackageMode) -> HashMap<String, (String, String)> {
+    adapter
+        .list_installed(mode)
+        .await
+        .map(|held| {
+            held.into_iter()
+                .map(|p| (p.package.id, (p.package.name, p.package.version)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The packages whose version moved, named so they can be reported.
+fn changed_between(
+    before: &HashMap<String, (String, String)>,
+    after: &HashMap<String, (String, String)>,
+) -> Vec<String> {
+    let mut moved: Vec<String> = after
+        .iter()
+        .filter(|(id, (_, now))| before.get(*id).is_none_or(|(_, was)| was != now))
+        .map(|(_, (name, _))| name.clone())
+        .collect();
+
+    moved.sort();
+    moved
+}
+
+/// What to say once a manager has updated everything it holds.
+///
+/// It reports nothing about the packages it touched, so the only honest
+/// account is the one taken from what it held either side of the run.
+fn wholesale_outcome(adapter_name: &str, changed: &[String]) -> (ToastLevel, String) {
+    match changed {
+        [] => (
+            ToastLevel::Info,
+            format!("{adapter_name} had nothing to update"),
+        ),
+        [..] if changed.len() <= 3 => (
+            ToastLevel::Success,
+            format!("Updated {}", changed.join(", ")),
+        ),
+        _ => (
+            ToastLevel::Success,
+            format!("Updated {} {adapter_name} packages", changed.len()),
+        ),
+    }
+}
+
 /// The version a manager holds for a package right now, or nothing when it
 /// cannot say.
 async fn version_of(adapter: &dyn Adapter, package_id: &str, mode: PackageMode) -> Option<String> {
@@ -802,8 +851,8 @@ impl App {
                 }
 
                 let results = crate::tokio_spawn(async move {
-                    // Every manager at once: one that is slow to answer would
-                    // otherwise hold up the ones that are ready.
+                    // All at once: a slow manager would otherwise hold up the
+                    // ones that are ready.
                     let mut asking = tokio::task::JoinSet::new();
                     for adapter in manager_adapters {
                         let query = query.clone();
@@ -882,11 +931,10 @@ impl App {
             .collect()
     }
 
-    /// The managers a search goes out to: the ones that can answer one here,
-    /// narrowed to what Browse is asking for.
+    /// The managers a search goes out to, narrowed to what Browse asked for.
     ///
     /// A pick made in one scope can name a manager that does not work in the
-    /// other. Narrowing to nothing would search nowhere, so it is read as not
+    /// other. Narrowing to nothing would search nowhere, so it reads as not
     /// having narrowed at all.
     fn searching_adapters(&self, mode: PackageMode) -> Vec<Arc<dyn Adapter>> {
         let can_answer: Vec<Arc<dyn Adapter>> = self
@@ -951,7 +999,7 @@ impl App {
                             Err(e) => log::warn!("List installed failed: {e}"),
                         }
                         let caps = adapter.capabilities();
-                        if caps.can_update && !caps.can_list_updates {
+                        if caps.can_update && caps.can_update_one && !caps.can_list_updates {
                             updatable_adapters.insert(adapter.info().id.clone());
                         }
                     }
@@ -1412,9 +1460,9 @@ impl App {
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let (all_updates, no_update_listing) = crate::tokio_spawn(async move {
+                let (all_updates, limits) = crate::tokio_spawn(async move {
                     let mut all_updates = Vec::new();
-                    let mut no_update_listing = Vec::new();
+                    let mut limits: Vec<views::updates::ManagerLimit> = Vec::new();
 
                     for adapter in &manager_adapters {
                         let caps = adapter.capabilities();
@@ -1423,12 +1471,26 @@ impl App {
                                 Ok(updates) => all_updates.extend(updates),
                                 Err(e) => log::warn!("Check updates failed: {e}"),
                             }
-                        } else if caps.can_update {
-                            no_update_listing
-                                .push((adapter.info().id.clone(), adapter.info().name.clone()));
                         }
+
+                        let said = if !caps.can_update {
+                            continue;
+                        } else if !caps.can_list_updates {
+                            "does not report which packages have updates."
+                        } else if !caps.can_update_one {
+                            "updates everything it holds in one go."
+                        } else {
+                            continue;
+                        };
+
+                        limits.push(views::updates::ManagerLimit {
+                            adapter_id: adapter.info().id.clone(),
+                            adapter_name: adapter.info().name.clone(),
+                            said: said.to_string(),
+                            can_update_all: caps.can_update_all,
+                        });
                     }
-                    (all_updates, no_update_listing)
+                    (all_updates, limits)
                 })
                 .await
                 .unwrap_or_default();
@@ -1438,7 +1500,7 @@ impl App {
                         app.updates_state.updates = all_updates;
                         app.updates_state.loading = false;
                         app.updates_state.checked = true;
-                        app.updates_state.no_update_listing = no_update_listing;
+                        app.updates_state.limits = limits;
                         app.updates_state.result_version += 1;
                         cx.notify();
                     })
@@ -3282,6 +3344,12 @@ impl Render for App {
                 ConfirmAction::UpdateAll(mode) => {
                     format!("Update all packages?{}", mode_suffix(mode))
                 }
+                ConfirmAction::UpdateEverythingIn {
+                    adapter_name, mode, ..
+                } => format!(
+                    "Update everything {adapter_name} holds?{} It cannot update one package on its own.",
+                    mode_suffix(mode)
+                ),
                 ConfirmAction::BatchInstall(pkgs, mode) => {
                     format!("Install {} packages?{}", pkgs.len(), mode_suffix(mode))
                 }
@@ -4384,7 +4452,7 @@ impl App {
         self.installed_state.packages.clear();
         self.updates_state.checked = false;
         self.updates_state.updates.clear();
-        self.updates_state.no_update_listing.clear();
+        self.updates_state.limits.clear();
         cx.notify();
     }
 
@@ -4415,6 +4483,13 @@ impl App {
             }
             ConfirmAction::UpdateAll(_mode) => {
                 self.update_all(cx);
+            }
+            ConfirmAction::UpdateEverythingIn {
+                adapter_id,
+                adapter_name,
+                mode,
+            } => {
+                self.update_everything_in(adapter_id, adapter_name, mode, cx);
             }
             ConfirmAction::BatchInstall(pkgs, mode) => {
                 self.batch_install(pkgs, mode, cx);
@@ -4622,6 +4697,72 @@ impl App {
         }
     }
 
+    /// Hand a manager that cannot be pointed at one package the only update
+    /// it understands.
+    fn update_everything_in(
+        &mut self,
+        adapter_id: String,
+        adapter_name: String,
+        mode: PackageMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(adapter) = self.adapter_manager.get_adapter(&adapter_id) else {
+            self.add_toast(
+                ToastLevel::Error,
+                format!("Cannot update: {adapter_id} is not loaded"),
+            );
+            return;
+        };
+
+        self.updates_state.updating = Some(adapter_id.clone());
+        let progress_sender = self.progress_sender.clone();
+        cx.notify();
+
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = crate::tokio_spawn(async move {
+                    // The manager says nothing about which packages it means,
+                    // so the answer has to come from what it held either side
+                    // of the run.
+                    let before = held_by(adapter.as_ref(), mode).await;
+                    let outcome = adapter.update_all(Some(progress_sender), mode).await;
+                    let changed = match &outcome {
+                        Ok(()) => changed_between(&before, &held_by(adapter.as_ref(), mode).await),
+                        Err(_) => Vec::new(),
+                    };
+
+                    (outcome, changed)
+                })
+                .await;
+
+                let _ = cx.update(|cx| {
+                    this.update(cx, |app, cx| {
+                        app.updates_state.updating = None;
+                        app.updates_state.result_version += 1;
+                        app.installed_state.result_version += 1;
+                        match result {
+                            Ok((Ok(()), changed)) => {
+                                let (level, said) = wholesale_outcome(&adapter_name, &changed);
+                                app.add_toast(level, said);
+                            }
+                            Ok((Err(e), _)) => app.add_toast(
+                                ToastLevel::Error,
+                                format!("Failed to update {adapter_name}: {e}"),
+                            ),
+                            Err(e) => app.add_toast(
+                                ToastLevel::Error,
+                                format!("Failed to update {adapter_name}: {e}"),
+                            ),
+                        }
+                        app.installed_state.loaded = false;
+                        cx.notify();
+                    })
+                });
+            },
+        )
+        .detach();
+    }
+
     fn update_package(
         &mut self,
         pkg: crate::core::package::Package,
@@ -4638,14 +4779,10 @@ impl App {
             return;
         };
 
-        // Both views show the same package, and either can be the one the
-        // button was pressed in.
         self.updates_state.updating = Some(pkg.id.clone());
         self.installed_state.updating = Some(pkg.id.clone());
 
-        // Stand in until the manager says something itself. A manager that
-        // reports nothing until it is done would otherwise leave the card
-        // looking untouched for the whole update.
+        // Stands in until the manager says something of its own.
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
         self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
@@ -4658,10 +4795,6 @@ impl App {
                 let result = crate::tokio_spawn(async move {
                     let outcome = adapter.update(&[pkg], Some(progress_sender), mode).await;
 
-                    // What the manager holds now that it is done. A command
-                    // that ran without complaining has not necessarily
-                    // changed anything, and one told to update everything
-                    // never said which package it meant.
                     let now = match &outcome {
                         Ok(_) => version_of(adapter.as_ref(), &pkg_id, mode).await,
                         Err(_) => None,
@@ -4954,6 +5087,37 @@ mod tests {
     // Deliberately not glob importing the parent: it pulls in gpui's prelude,
     // which shadows the test attribute.
     use super::readable;
+
+    #[test]
+    fn a_wholesale_update_reports_what_actually_moved() {
+        use super::{ToastLevel, changed_between, wholesale_outcome};
+        use std::collections::HashMap;
+
+        let held = |pairs: &[(&str, &str)]| -> HashMap<String, (String, String)> {
+            pairs
+                .iter()
+                .map(|(name, version)| (name.to_string(), (name.to_string(), version.to_string())))
+                .collect()
+        };
+
+        let before = held(&[("htop", "3.5.2"), ("firedragon", "12.9.1")]);
+        let after = held(&[("htop", "3.5.2"), ("firedragon", "12.9.2")]);
+        assert_eq!(changed_between(&before, &after), vec!["firedragon"]);
+
+        let (level, said) = wholesale_outcome("AppMan", &changed_between(&before, &after));
+        assert_eq!(level, ToastLevel::Success);
+        assert_eq!(said, "Updated firedragon");
+
+        // A run that moved nothing is not an update, however cleanly it ran.
+        let (level, said) = wholesale_outcome("AppMan", &changed_between(&before, &before));
+        assert_eq!(level, ToastLevel::Info);
+        assert_eq!(said, "AppMan had nothing to update");
+
+        // Too many to name, so they are counted instead.
+        let many: Vec<String> = (0..5).map(|n| format!("pkg{n}")).collect();
+        let (_, said) = wholesale_outcome("AppMan", &many);
+        assert_eq!(said, "Updated 5 AppMan packages");
+    }
 
     #[test]
     fn an_update_that_changed_nothing_does_not_claim_it_did() {

@@ -8,6 +8,17 @@ use crate::{
     styles, theme,
 };
 
+/// Something a manager cannot do that the Updates view would otherwise be
+/// expected to offer, and the manager it is about.
+#[derive(Debug, Clone)]
+pub struct ManagerLimit {
+    pub adapter_id: String,
+    pub adapter_name: String,
+    pub said: String,
+    /// Whether updating everything it holds is still on the table.
+    pub can_update_all: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct UpdatesState {
     pub updates: Vec<Update>,
@@ -16,7 +27,7 @@ pub struct UpdatesState {
     pub error: Option<String>,
     pub result_version: u64,
     pub updating: Option<String>,
-    pub no_update_listing: Vec<(String, String)>,
+    pub limits: Vec<ManagerLimit>,
     pub selected: HashSet<String>,
     pub package_progress: HashMap<String, OperationStatus>,
 }
@@ -209,28 +220,86 @@ impl App {
         let mut has_notes = false;
 
         if self.updates_state.checked {
-            for (_adapter_id, adapter_name) in &self.updates_state.no_update_listing {
+            for limit in &self.updates_state.limits {
                 has_notes = true;
-                notes_col = notes_col.child(
-                    div()
-                        .px(px(styles::spacing::MD))
-                        .py(px(styles::spacing::SM))
-                        .rounded(px(styles::radius::MD))
-                        .bg(surface)
-                        .border_1()
-                        .border_color(border)
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(styles::spacing::MD))
-                        .child(
-                            div()
-                                .text_size(px(styles::font_size::SMALL))
-                                .text_color(text_muted)
-                                .child(format!("{adapter_name} cannot detect available updates.")),
-                        ),
-                );
+                let ManagerLimit {
+                    adapter_id,
+                    adapter_name,
+                    said,
+                    can_update_all,
+                } = limit;
+
+                let mut note = div()
+                    .px(px(styles::spacing::MD))
+                    .py(px(styles::spacing::SM))
+                    .rounded(px(styles::radius::MD))
+                    .bg(surface)
+                    .border_1()
+                    .border_color(border)
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(styles::spacing::MD))
+                    .w_full()
+                    .child(
+                        div()
+                            .text_size(px(styles::font_size::SMALL))
+                            .text_color(text_muted)
+                            .child(format!("{adapter_name} {said}")),
+                    );
+
+                if *can_update_all && !is_busy {
+                    let for_adapter = adapter_id.clone();
+                    let named = adapter_name.clone();
+                    let update_everything = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+                        app.confirm_dialog = Some(crate::app::ConfirmAction::UpdateEverythingIn {
+                            adapter_id: for_adapter.clone(),
+                            adapter_name: named.clone(),
+                            mode: app.current_mode,
+                        });
+                        cx.notify();
+                    });
+
+                    note = note.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "update-everything-{adapter_id}"
+                            )))
+                            .flex_shrink_0()
+                            .px(px(14.0))
+                            .py(px(styles::spacing::XS))
+                            .rounded(px(styles::radius::MD))
+                            .bg(surface)
+                            .border_1()
+                            .border_color(border)
+                            .cursor_pointer()
+                            .text_size(px(styles::font_size::SMALL))
+                            .hover(move |s| s.bg(hover))
+                            .on_click(update_everything)
+                            .child("Update all"),
+                    );
+                }
+
+                notes_col = notes_col.child(note);
             }
+        }
+
+        // The title, its buttons and what a manager cannot answer stay put, so
+        // a long list of updates cannot push them out of sight.
+        let mut pinned = div()
+            .flex_shrink_0()
+            .w_full()
+            .px(px(styles::spacing::XL))
+            .pt(px(styles::spacing::XL))
+            .pb(px(styles::spacing::MD))
+            .flex()
+            .flex_col()
+            .gap(px(styles::spacing::MD))
+            .child(header_row);
+
+        if has_notes {
+            pinned = pinned.child(notes_col);
         }
 
         let mut main_col = div()
@@ -238,12 +307,7 @@ impl App {
             .flex_col()
             .gap(px(styles::spacing::LG))
             .w_full()
-            .child(header_row)
             .child(content);
-
-        if has_notes {
-            main_col = main_col.child(notes_col);
-        }
 
         if !self.updates_state.selected.is_empty() {
             let count = self.updates_state.selected.len();
@@ -267,20 +331,31 @@ impl App {
         }
 
         div()
-            .id("updates-scroll")
             .flex_1()
             .min_h_0()
             .min_w_0()
             .w_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .child(pinned)
             .child(
                 div()
-                    .p(px(styles::spacing::XL))
-                    .flex()
-                    .flex_col()
-                    .w_full()
+                    .id("updates-scroll")
+                    .flex_1()
+                    .min_h_0()
                     .min_w_0()
-                    .child(main_col),
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px(px(styles::spacing::XL))
+                            .pb(px(styles::spacing::XL))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .min_w_0()
+                            .child(main_col),
+                    ),
             )
     }
 
@@ -391,7 +466,16 @@ impl App {
             );
         }
 
-        let update_btn: AnyElement = if is_updating_this || is_updating_all || is_updating_batch {
+        // A manager that cannot be pointed at one package is asked from the
+        // note above the list instead.
+        let can_update_one = self
+            .adapter_manager
+            .get_adapter(&update.package.adapter_id)
+            .is_some_and(|a| a.capabilities().can_update_one);
+
+        let update_btn: AnyElement = if !can_update_one {
+            div().into_any_element()
+        } else if is_updating_this || is_updating_all || is_updating_batch {
             let label = pkg_status
                 .map(|s| s.label())
                 .unwrap_or_else(|| "Updating...".into());

@@ -994,10 +994,8 @@ impl App {
         }
     }
 
-    /// The row of managers a search can be narrowed to, one chip each.
-    ///
-    /// With nothing picked every manager answers, so all the chips read as on
-    /// until one is turned off.
+    /// The row of managers a search can be narrowed to, one chip each. With
+    /// nothing picked every manager answers, so the chips all read as on.
     fn render_manager_filter(
         &self,
         searchable: &[String],
@@ -1005,8 +1003,6 @@ impl App {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let asked_for = &self.browse_state.manager_filter;
-        // A pick naming only managers that cannot answer here narrows to
-        // nothing, which the search reads as asking all of them.
         let narrowed = searchable.iter().any(|id| asked_for.contains(id));
         let border = theme.border;
         let text_muted = theme.text_muted;

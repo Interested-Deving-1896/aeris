@@ -9,6 +9,14 @@ pub struct Capabilities {
     pub can_install: bool,
     pub can_remove: bool,
     pub can_update: bool,
+    /// Whether an update can be pointed at one package.
+    ///
+    /// A manager without this updates everything it holds instead, so
+    /// offering to update one package would quietly act on all the others.
+    pub can_update_one: bool,
+    /// Whether the manager can be told to update everything it holds in one
+    /// go, rather than being handed the packages to update.
+    pub can_update_all: bool,
     pub can_list: bool,
     pub can_list_updates: bool,
     pub can_sync: bool,

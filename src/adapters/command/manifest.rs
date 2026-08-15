@@ -29,6 +29,9 @@ pub const OP_INFO_INSTALLED: &str = "info_installed";
 pub const OP_INSTALL: &str = "install";
 pub const OP_REMOVE: &str = "remove";
 pub const OP_UPDATE: &str = "update";
+/// Update everything the manager holds, for a manager that offers that as a
+/// command of its own rather than as an update naming no package.
+pub const OP_UPDATE_ALL: &str = "update_all";
 pub const OP_SYNC: &str = "sync";
 pub const OP_LIST_REPOS: &str = "list_repos";
 pub const OP_ADD_REPO: &str = "add_repo";

@@ -45,6 +45,11 @@ impl App {
             .collect();
 
         let header = div()
+            .flex_shrink_0()
+            .w_full()
+            .px(px(styles::spacing::XL))
+            .pt(px(styles::spacing::XL))
+            .pb(px(styles::spacing::MD))
             .text_size(px(styles::font_size::TITLE))
             .child("Adapters");
 
@@ -53,8 +58,7 @@ impl App {
             .flex()
             .flex_col()
             .gap(px(styles::spacing::LG))
-            .w_full()
-            .child(header);
+            .w_full();
 
         // Installed adapters section
         content = content.child(
@@ -63,9 +67,14 @@ impl App {
                 .child("Installed Adapters"),
         );
 
-        for (info, enabled) in &adapters {
+        for (at, (info, enabled)) in adapters.iter().enumerate() {
             let has_repos = info.capabilities.can_list_repos && *enabled;
             let has_profiles = info.capabilities.has_profiles && *enabled;
+
+            if at > 0 {
+                content = content.child(div().w_full().h(px(1.0)).bg(border));
+            }
+
             content = content.child(self.render_adapter_card(info, *enabled, theme, cx));
 
             if has_profiles {
@@ -75,23 +84,51 @@ impl App {
             if has_repos {
                 content = content.child(self.render_repos_section(&info.id, theme, cx));
             }
-
-            content = content.child(div().w_full().h(px(1.0)).bg(border));
         }
 
-        // Separator
-        content = content.child(div().w_full().h(px(2.0)).bg(border));
+        if !unusable.is_empty() {
+            content = content.child(div().w_full().h(px(2.0)).bg(border));
+        }
 
         for (info, reason) in &unusable {
             content = content.child(self.render_unusable_card(info, reason, theme, cx));
         }
 
         // Available plugins section
-        content = content.child(
-            div()
-                .text_size(px(styles::font_size::HEADING))
-                .child("Available Plugins"),
-        );
+        let refresh_plugins = cx.listener(|app, _: &ClickEvent, _window, cx| {
+            app.fetch_registry(cx);
+        });
+        let mut plugins_header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .child(
+                div()
+                    .text_size(px(styles::font_size::HEADING))
+                    .child("Available Plugins"),
+            );
+
+        if !self.adapter_view.registry_plugins.is_empty() {
+            plugins_header = plugins_header.child(
+                div()
+                    .id("refresh-plugins-btn")
+                    .px(px(14.0))
+                    .py(px(styles::spacing::XS))
+                    .rounded(px(styles::radius::MD))
+                    .bg(surface)
+                    .border_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .text_size(px(styles::font_size::SMALL))
+                    .hover(move |s| s.bg(hover))
+                    .on_click(refresh_plugins)
+                    .child("Refresh"),
+            );
+        }
+
+        content = content.child(plugins_header);
 
         if self.adapter_view.registry_plugins.is_empty() && !self.adapter_view.registry_loading {
             let fetch_listener = cx.listener(|app, _: &ClickEvent, _window, cx| {
@@ -170,25 +207,6 @@ impl App {
                 );
             }
 
-            let refresh_listener = cx.listener(|app, _: &ClickEvent, _window, cx| {
-                app.fetch_registry(cx);
-            });
-            content = content.child(
-                div()
-                    .id("refresh-plugins-btn")
-                    .px(px(styles::spacing::SM))
-                    .py(px(styles::spacing::XS))
-                    .rounded(px(styles::radius::MD))
-                    .bg(surface)
-                    .border_1()
-                    .border_color(border)
-                    .cursor_pointer()
-                    .text_size(px(styles::font_size::SMALL))
-                    .hover(move |s| s.bg(hover))
-                    .on_click(refresh_listener)
-                    .child("Refresh"),
-            );
-
             if let Some(ref err) = self.adapter_view.registry_error {
                 content = content.child(
                     div()
@@ -200,18 +218,28 @@ impl App {
         }
 
         div()
-            .id("adapters-scroll")
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .child(header)
             .child(
                 div()
-                    .p(px(styles::spacing::XL))
-                    .flex()
-                    .flex_col()
+                    .id("adapters-scroll")
+                    .flex_1()
+                    .min_h_0()
                     .w_full()
-                    .child(content),
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .px(px(styles::spacing::XL))
+                            .pb(px(styles::spacing::XL))
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .child(content),
+                    ),
             )
     }
 
@@ -563,6 +591,7 @@ impl App {
         let header_row = div()
             .flex()
             .flex_row()
+            .w_full()
             .items_center()
             .justify_between()
             .child(div().text_size(px(styles::font_size::HEADING)).child(title))
@@ -657,9 +686,12 @@ impl App {
         }
 
         div()
+            .flex()
+            .flex_col()
             .px(px(styles::spacing::LG))
             .py(px(styles::spacing::MD))
             .w_full()
+            .min_w_0()
             .child(section)
     }
 
@@ -695,6 +727,8 @@ impl App {
             );
 
         let url = div()
+            .w_full()
+            .truncate()
             .text_size(px(styles::font_size::SMALL))
             .text_color(text_muted)
             .child(repo.url.clone());
@@ -798,6 +832,7 @@ impl App {
 
         let left = div()
             .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(styles::spacing::XXS))
@@ -807,6 +842,8 @@ impl App {
 
         div()
             .id(SharedString::from(format!("repo-{adapter_id}-{idx}")))
+            .w_full()
+            .min_w_0()
             .px(px(styles::spacing::MD))
             .py(px(styles::spacing::MD))
             .rounded(px(styles::radius::MD))
@@ -1110,6 +1147,7 @@ impl App {
             ("Install", caps.can_install),
             ("Remove", caps.can_remove),
             ("Update", caps.can_update),
+            ("Update One", caps.can_update_one),
             ("List", caps.can_list),
             ("List Updates", caps.can_list_updates),
             ("Sync", caps.can_sync),

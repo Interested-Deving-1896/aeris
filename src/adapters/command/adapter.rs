@@ -28,7 +28,7 @@ use super::{
         self, CommandManifest, Format, OP_ADD_REPO, OP_APPLY, OP_APPLY_CHECK, OP_APPLY_PRUNE,
         OP_DEFAULT_CONFIG, OP_INFO, OP_INFO_INSTALLED, OP_INSTALL, OP_LIST, OP_LIST_INSTALLED,
         OP_LIST_REPOS, OP_LIST_UPDATES, OP_PATHS, OP_REMOVE, OP_REMOVE_REPO, OP_SEARCH,
-        OP_SET_REPO_ENABLED, OP_SYNC, OP_UPDATE, Op, Setting, SettingKind,
+        OP_SET_REPO_ENABLED, OP_SYNC, OP_UPDATE, OP_UPDATE_ALL, Op, Setting, SettingKind,
     },
     output, version,
 };
@@ -437,11 +437,7 @@ impl CommandAdapter {
         let op = self.op(op_name)?;
 
         if !takes_a_package(op) {
-            // An op naming no package still acts for whoever was asked about,
-            // and it is their card waiting to hear something. Addressed to
-            // nobody, everything it says would be filed under no package at
-            // all and shown nowhere. Only one package can be spoken for, so a
-            // batch still goes unaddressed.
+            // Progress goes to whoever was asked about, or nowhere at all.
             let addressed = match packages {
                 [only] => only.id.clone(),
                 _ => String::new(),
@@ -596,6 +592,12 @@ impl Adapter for CommandAdapter {
         mode: PackageMode,
     ) -> Result<Vec<InstallResult>> {
         self.run_over(OP_UPDATE, packages, progress, mode).await
+    }
+
+    async fn update_all(&self, progress: Option<ProgressSender>, mode: PackageMode) -> Result<()> {
+        self.run(OP_UPDATE_ALL, Values::new(), progress, String::new(), mode)
+            .await?;
+        Ok(())
     }
 
     async fn list_installed(&self, mode: PackageMode) -> Result<Vec<InstalledPackage>> {
@@ -1078,7 +1080,9 @@ fn scoped_capabilities(
         can_search: has(OP_SEARCH),
         can_install: has(OP_INSTALL),
         can_remove: has(OP_REMOVE),
-        can_update: has(OP_UPDATE),
+        can_update: has(OP_UPDATE) || has(OP_UPDATE_ALL),
+        can_update_one: manifest.op(OP_UPDATE).is_some_and(takes_a_package),
+        can_update_all: has(OP_UPDATE_ALL),
         can_list: has(OP_LIST) || has(OP_LIST_INSTALLED),
         can_list_updates: has(OP_LIST_UPDATES),
         can_sync: has(OP_SYNC),
@@ -1763,6 +1767,48 @@ progress = { event = "type", current = "current", total = "total", message = "pk
         assert!(!capabilities.can_remove);
         assert!(!capabilities.can_list_updates);
         assert!(capabilities.has_size_info);
+    }
+
+    #[test]
+    fn naming_a_package_is_what_makes_an_update_about_one() {
+        let one = manifest(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+
+[detect]
+command = "demo"
+
+[ops.update]
+args = ["update", "{selector}"]
+output = { format = "lines" }
+"#,
+        );
+        let caps = capabilities_from(&one);
+        assert!(caps.can_update);
+        assert!(caps.can_update_one);
+        assert!(!caps.can_update_all);
+
+        // Everything at once, which is not something to offer per package.
+        let wholesale = manifest(
+            r#"
+schema_version = 1
+id = "demo"
+name = "Demo"
+
+[detect]
+command = "demo"
+
+[ops.update_all]
+args = ["upgrade"]
+output = { format = "lines" }
+"#,
+        );
+        let caps = capabilities_from(&wholesale);
+        assert!(caps.can_update);
+        assert!(!caps.can_update_one);
+        assert!(caps.can_update_all);
     }
 
     #[test]

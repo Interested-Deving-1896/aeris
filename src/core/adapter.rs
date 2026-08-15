@@ -156,6 +156,18 @@ pub trait Adapter: Send + Sync {
         mode: PackageMode,
     ) -> Result<Vec<InstallResult>>;
 
+    /// Update everything the manager holds, without naming any of it.
+    ///
+    /// The only way to update at all for a manager that cannot be pointed at
+    /// one package, and the cheaper way for one that can.
+    async fn update_all(
+        &self,
+        _progress: Option<ProgressSender>,
+        _mode: PackageMode,
+    ) -> Result<()> {
+        Err(AdapterError::NotSupported)
+    }
+
     async fn list_installed(&self, mode: PackageMode) -> Result<Vec<InstalledPackage>>;
 
     async fn list_updates(&self, mode: PackageMode) -> Result<Vec<Update>>;
