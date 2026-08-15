@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use gpui::*;
 
+use crate::core::registry::Source;
 use crate::{
     app::{App, AppTheme, View},
     components::TextInput,
@@ -19,8 +20,10 @@ use crate::{
 pub enum SettingsEditScope {
     /// A field on the active adapter's configuration.
     Adapter,
-    /// The registry URL, which is an Aeris-level setting.
-    RegistryUrl,
+    /// What a registry is called, by its place in the list.
+    RegistryName(usize),
+    /// Where a registry is read from, by its place in the list.
+    RegistryUrl(usize),
 }
 
 pub struct SettingsEdit {
@@ -31,16 +34,24 @@ pub struct SettingsEdit {
     pub input: Entity<TextInput>,
 }
 
+/// How a registry answered when it was last read.
+#[derive(Debug, Clone)]
+pub enum RegistryTest {
+    Running,
+    Offered(usize),
+    Failed(String),
+}
+
 pub struct SettingsState {
     pub selected_theme: AppTheme,
     pub startup_view: View,
     pub notifications: bool,
-    /// Where the adapter registry is read from, or empty for the default.
-    pub registry_url: String,
-    /// The result of the last "test connection" probe of the registry URL.
-    pub registry_testing: bool,
-    pub registry_test_error: Option<String>,
-    pub registry_test_count: Option<usize>,
+    /// The registries to read, in the order they are trusted.
+    pub registries: Vec<Source>,
+    /// The last probe of each registry, keyed by URL rather than by position so
+    /// reordering keeps every result with the registry it came from, and editing
+    /// a URL drops a result that no longer describes it.
+    pub registry_tests: HashMap<String, RegistryTest>,
     pub aeris_dirty: bool,
     pub aeris_save_error: Option<String>,
     pub aeris_save_success: bool,
@@ -66,10 +77,8 @@ impl Default for SettingsState {
             selected_theme: AppTheme::System,
             startup_view: View::Dashboard,
             notifications: true,
-            registry_url: String::new(),
-            registry_testing: false,
-            registry_test_error: None,
-            registry_test_count: None,
+            registries: Vec::new(),
+            registry_tests: HashMap::new(),
             aeris_dirty: false,
             aeris_save_error: None,
             aeris_save_success: false,
@@ -107,10 +116,8 @@ impl SettingsState {
             selected_theme: aeris_config.theme(),
             startup_view: aeris_config.startup_view(),
             notifications: aeris_config.notifications.unwrap_or(true),
-            registry_url: aeris_config.registry_url.clone().unwrap_or_default(),
-            registry_testing: false,
-            registry_test_error: None,
-            registry_test_count: None,
+            registries: aeris_config.registries(),
+            registry_tests: HashMap::new(),
             aeris_dirty: false,
             aeris_save_error: None,
             aeris_save_success: false,
@@ -201,14 +208,12 @@ impl App {
                     .child(
                         div()
                             .text_size(px(styles::font_size::BODY))
-                            .child("Registry URL"),
+                            .child("Registries"),
                     )
-                    .child(self.render_registry_url_field(theme, cx)),
+                    .child(self.render_registries(theme, cx)),
             ],
             theme,
         );
-
-        let registry_actions = self.render_registry_actions(theme, cx);
 
         let aeris_actions = self.render_aeris_actions(theme, cx);
 
@@ -219,7 +224,6 @@ impl App {
             .child(appearance_card)
             .child(general_card)
             .child(registry_card)
-            .child(registry_actions)
             .child(aeris_actions);
 
         if let Some(ref err) = self.settings_state.aeris_save_error {
@@ -580,83 +584,173 @@ impl App {
         switch("notifications-toggle", checked, theme, Box::new(listener))
     }
 
-    fn render_registry_url_field(
-        &self,
-        theme: &theme::Theme,
-        cx: &mut Context<App>,
-    ) -> impl IntoElement {
-        let primary = theme.primary;
+    /// The registries to read, in the order they are trusted.
+    ///
+    /// The order is the point rather than decoration: where two registries
+    /// offer the same adapter, the one higher up is the one offered.
+    fn render_registries(&self, theme: &theme::Theme, cx: &mut Context<App>) -> Div {
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(styles::spacing::XS))
+            .w_full();
 
-        // Nothing set still has a value in effect — the default — so the actual
-        // URL is shown (muted) rather than a bare label. The input is left
-        // empty, so an unset value stays that way until something is typed.
-        let (display, is_default) = if self.settings_state.registry_url.trim().is_empty() {
-            (
-                crate::core::registry::DEFAULT_REGISTRY_URL.to_string(),
-                true,
-            )
-        } else {
-            (self.settings_state.registry_url.clone(), false)
-        };
-        let color = if is_default {
-            theme.text_muted
-        } else {
-            theme.text
-        };
+        let last = self.settings_state.registries.len().saturating_sub(1);
+        for (at, source) in self.settings_state.registries.iter().enumerate() {
+            list = list.child(self.render_registry_row(at, source, at == last, theme, cx));
+        }
 
-        let listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
-            app.open_registry_url_edit(cx);
+        let add = cx.listener(|app, _: &ClickEvent, _window, cx| {
+            app.add_registry(cx);
         });
-
-        div()
-            .id("registry-url-edit")
-            .min_w(px(0.0))
-            .overflow_hidden()
-            .text_size(px(styles::font_size::BODY))
-            .text_color(color)
-            .cursor_pointer()
-            .hover(move |s| s.text_color(primary))
-            .on_click(listener)
-            .child(display)
-    }
-
-    /// The "Test connection" button for the registry URL and the result of the
-    /// last probe, shown inline so a bad URL is obvious before it is saved.
-    fn render_registry_actions(&self, theme: &theme::Theme, cx: &mut Context<Self>) -> Div {
-        let danger = theme.danger;
-        let success = theme.success;
-        let text_muted = theme.text_muted;
-
-        let testing = self.settings_state.registry_testing;
-        let test_listener = cx.listener(move |app, _: &ClickEvent, _window, cx| {
-            app.test_registry(cx);
-        });
-
-        let mut row = div().flex().flex_col().gap(px(styles::spacing::SM));
-        row = row.child(div().flex().flex_row().child(action_button(
-            "registry-test-btn",
-            "Test connection",
-            !testing,
+        list.child(div().flex().flex_row().child(action_button(
+            "registry-add-btn",
+            "Add registry",
+            true,
             false,
             theme,
-            Box::new(test_listener),
-        )));
+            Box::new(add),
+        )))
+    }
 
-        if testing {
+    fn render_registry_row(
+        &self,
+        at: usize,
+        source: &Source,
+        is_last: bool,
+        theme: &theme::Theme,
+        cx: &mut Context<App>,
+    ) -> Div {
+        let primary = theme.primary;
+        let text_muted = theme.text_muted;
+
+        let name = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.open_registry_edit(at, false, cx);
+        });
+        let url = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.open_registry_edit(at, true, cx);
+        });
+
+        let named = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(styles::spacing::XXXS))
+            .child(
+                div()
+                    .id(SharedString::from(format!("registry-name-{at}")))
+                    .w_full()
+                    .truncate()
+                    .text_size(px(styles::font_size::BODY))
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(primary))
+                    .on_click(name)
+                    .child(source.name()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("registry-url-{at}")))
+                    .w_full()
+                    .truncate()
+                    .text_size(px(styles::font_size::SMALL))
+                    .text_color(text_muted)
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(primary))
+                    .on_click(url)
+                    .child(source.url().to_string()),
+            );
+
+        let up = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.move_registry(at, true, cx);
+        });
+        let down = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.move_registry(at, false, cx);
+        });
+        let remove = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.remove_registry(at, cx);
+        });
+        let test = cx.listener(move |app, _: &ClickEvent, _window, cx| {
+            app.test_registry(at, cx);
+        });
+
+        let probe = self.settings_state.registry_tests.get(source.url());
+        let running = matches!(probe, Some(RegistryTest::Running));
+
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .gap(px(styles::spacing::XXS))
+            .w_full()
+            .min_w_0()
+            .px(px(styles::spacing::MD))
+            .py(px(styles::spacing::SM))
+            .rounded(px(styles::radius::MD))
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(styles::spacing::SM))
+                    .w_full()
+                    .min_w_0()
+                    .child(named)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_shrink_0()
+                            .gap(px(styles::spacing::XXS))
+                            .child(action_button(
+                                &format!("registry-test-{at}"),
+                                "Test",
+                                !running,
+                                false,
+                                theme,
+                                Box::new(test),
+                            ))
+                            .child(action_button(
+                                &format!("registry-up-{at}"),
+                                "\u{2191}",
+                                at > 0,
+                                false,
+                                theme,
+                                Box::new(up),
+                            ))
+                            .child(action_button(
+                                &format!("registry-down-{at}"),
+                                "\u{2193}",
+                                !is_last,
+                                false,
+                                theme,
+                                Box::new(down),
+                            ))
+                            .child(action_button(
+                                &format!("registry-remove-{at}"),
+                                "Remove",
+                                true,
+                                false,
+                                theme,
+                                Box::new(remove),
+                            )),
+                    ),
+            );
+
+        if let Some(probe) = probe {
+            let (message, color) = match probe {
+                RegistryTest::Running => ("Reading it…".to_string(), text_muted),
+                RegistryTest::Offered(count) => (format!("Offers {count} adapters"), theme.success),
+                RegistryTest::Failed(err) => (err.clone(), theme.danger),
+            };
             row = row.child(
                 div()
                     .text_size(px(styles::font_size::SMALL))
-                    .text_color(text_muted)
-                    .child("Checking the registry…"),
+                    .text_color(color)
+                    .child(message),
             );
-        } else if let Some(ref err) = self.settings_state.registry_test_error {
-            row = row.child(banner(err, danger, true));
-        } else if let Some(count) = self.settings_state.registry_test_count {
-            row = row.child(banner(
-                &format!("Loaded {count} adapters from the registry."),
-                success,
-                false,
-            ));
         }
 
         row

@@ -2342,13 +2342,10 @@ impl App {
             _ => "dashboard".to_string(),
         });
         self.aeris_config.notifications = Some(self.settings_state.notifications);
-        // An empty URL falls back to the default, so it is stored as nothing
-        // rather than as an empty string.
-        self.aeris_config.registry_url = if self.settings_state.registry_url.trim().is_empty() {
-            None
-        } else {
-            Some(self.settings_state.registry_url.trim().to_string())
-        };
+        // Written as the list, whatever it was read from, so the single URL
+        // that came before it does not go on overriding what is shown here.
+        self.aeris_config.registries = self.settings_state.registries.clone();
+        self.aeris_config.registry_url = None;
 
         self.selected_theme = self.settings_state.selected_theme;
 
@@ -2365,35 +2362,39 @@ impl App {
         cx.notify();
     }
 
-    /// Fetch the registry from the URL currently in the box and report back
-    /// how many adapters it offers, or why it could not be read. The value is
-    /// tested as-is rather than waiting for a save, and a blank URL means the
-    /// default, so a source can be tried before it is committed.
-    pub fn test_registry(&mut self, cx: &mut Context<Self>) {
-        self.settings_state.registry_testing = true;
-        self.settings_state.registry_test_error = None;
-        self.settings_state.registry_test_count = None;
+    /// Read one registry and report how many adapters it offers, or why it
+    /// could not be read. The list is tested as it stands rather than as it was
+    /// saved, so a source can be tried before it is committed.
+    pub fn test_registry(&mut self, at: usize, cx: &mut Context<Self>) {
+        use crate::views::settings::RegistryTest;
 
-        let url = match self.settings_state.registry_url.trim() {
-            "" => crate::core::registry::DEFAULT_REGISTRY_URL.to_string(),
-            named => named.to_string(),
+        let Some(source) = self.settings_state.registries.get(at).cloned() else {
+            return;
         };
+        let url = source.url().to_string();
+
+        self.settings_state
+            .registry_tests
+            .insert(url.clone(), RegistryTest::Running);
+        cx.notify();
 
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
-                let result = crate::core::registry::fetch_registry(&url);
+                let (offered, errors) = crate::core::registry::fetch_all(&[source]);
+
                 let _ = cx.update(|cx| {
                     this.update(cx, |app, cx| {
-                        app.settings_state.registry_testing = false;
-                        match result {
-                            Ok(registry) => {
-                                app.settings_state.registry_test_count =
-                                    Some(registry.plugins.len());
-                            }
-                            Err(e) => {
-                                app.settings_state.registry_test_error = Some(e);
-                            }
-                        }
+                        let result = match errors.first() {
+                            // Reported against the row that names the URL, so
+                            // the URL the error leads with says nothing new.
+                            Some(err) => RegistryTest::Failed(
+                                err.strip_prefix(&format!("{url}: "))
+                                    .unwrap_or(err)
+                                    .to_string(),
+                            ),
+                            None => RegistryTest::Offered(offered.len()),
+                        };
+                        app.settings_state.registry_tests.insert(url, result);
                         cx.notify();
                     })
                 });
@@ -2621,21 +2622,76 @@ impl App {
 
     /// Open the shared settings editor for the registry URL, an Aeris-level
     /// value rather than a field on the active adapter.
-    pub fn open_registry_url_edit(&mut self, cx: &mut Context<Self>) {
-        let initial = self.settings_state.registry_url.clone();
+    /// Edit what a registry is called, or where it is read from.
+    pub fn open_registry_edit(&mut self, at: usize, url: bool, cx: &mut Context<Self>) {
+        use crate::views::settings::SettingsEditScope;
+
+        let Some(source) = self.settings_state.registries.get(at) else {
+            return;
+        };
+
+        let (initial, placeholder, label, scope) = match url {
+            true => (
+                source.url().to_string(),
+                "URL or local path",
+                "Registry address",
+                SettingsEditScope::RegistryUrl(at),
+            ),
+            false => (
+                source.name(),
+                "What to call it",
+                "Registry name",
+                SettingsEditScope::RegistryName(at),
+            ),
+        };
+
         let input = cx.new(|cx| {
-            let mut ti = crate::components::TextInput::new(cx, "URL or local path");
+            let mut ti = crate::components::TextInput::new(cx, placeholder);
             ti.set_content(initial, cx);
             ti
         });
         self.settings_state.edit = Some(crate::views::settings::SettingsEdit {
-            scope: crate::views::settings::SettingsEditScope::RegistryUrl,
-            key: "registry_url".to_string(),
-            label: "Registry URL".to_string(),
+            scope,
+            key: "registries".to_string(),
+            label: label.to_string(),
             field_type: crate::core::config::ConfigFieldType::Text,
             input,
         });
         self.pending_settings_edit_focus = true;
+        cx.notify();
+    }
+
+    pub fn add_registry(&mut self, cx: &mut Context<Self>) {
+        let at = self.settings_state.registries.len();
+        self.settings_state
+            .registries
+            .push(crate::core::registry::Source::Named {
+                name: "new registry".to_string(),
+                url: String::new(),
+            });
+        self.settings_state.aeris_dirty = true;
+        self.open_registry_edit(at, true, cx);
+    }
+
+    pub fn remove_registry(&mut self, at: usize, cx: &mut Context<Self>) {
+        if at >= self.settings_state.registries.len() {
+            return;
+        }
+        self.settings_state.registries.remove(at);
+        self.settings_state.aeris_dirty = true;
+        cx.notify();
+    }
+
+    /// Move a registry up or down, which is what decides who wins where two
+    /// of them offer the same adapter.
+    pub fn move_registry(&mut self, at: usize, up: bool, cx: &mut Context<Self>) {
+        let to = match up {
+            true if at > 0 => at - 1,
+            false if at + 1 < self.settings_state.registries.len() => at + 1,
+            _ => return,
+        };
+        self.settings_state.registries.swap(at, to);
+        self.settings_state.aeris_dirty = true;
         cx.notify();
     }
 
@@ -2652,14 +2708,18 @@ impl App {
             None => return,
         };
 
-        // The registry URL is an Aeris-level string rather than an adapter
-        // field, so it is written back to the Aeris settings rather than to
-        // the adapter config. An empty value means "use the default".
-        if edit.scope == SettingsEditScope::RegistryUrl {
-            let trimmed = raw.trim().to_string();
-            let changed = self.settings_state.registry_url != trimmed;
-            self.settings_state.registry_url = trimmed;
-            if changed {
+        // A registry is an Aeris-level setting rather than an adapter field,
+        // so it is written back to the Aeris settings.
+        if let SettingsEditScope::RegistryName(at) | SettingsEditScope::RegistryUrl(at) = edit.scope
+        {
+            let naming = matches!(edit.scope, SettingsEditScope::RegistryName(_));
+            if let Some(source) = self.settings_state.registries.get_mut(at) {
+                let raw = raw.trim().to_string();
+                let (name, url) = match (naming, &*source) {
+                    (true, source) => (raw, source.url().to_string()),
+                    (false, source) => (source.name(), raw),
+                };
+                *source = crate::core::registry::Source::Named { name, url };
                 self.settings_state.aeris_dirty = true;
             }
             cx.notify();
