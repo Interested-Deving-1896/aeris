@@ -15,7 +15,12 @@ pub struct InstalledState {
     pub loaded: bool,
     pub error: Option<String>,
     pub result_version: u64,
+    /// The `unique_key` of the package being removed, or `__batch__`.
     pub removing: Option<String>,
+    /// The [`progress_key`] of the package being updated, or `__batch__`. Keyed
+    /// by manager as well as name, because two managers can offer the same one.
+    ///
+    /// [`progress_key`]: crate::core::adapter::progress_key
     pub updating: Option<String>,
     pub updatable_adapters: HashSet<String>,
     /// Every package held, by [`package_key`]. Browse answers from this rather
@@ -483,7 +488,7 @@ impl App {
             .contains(&pkg.package.adapter_id);
 
         if show_update {
-            let is_updating = self.installed_state.updating.as_deref() == Some(&pkg.package.id)
+            let is_updating = self.installed_state.updating.as_deref() == Some(pkey.as_str())
                 || (self.installed_state.updating.as_deref() == Some("__batch__")
                     && pkg_status.is_some());
 

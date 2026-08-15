@@ -23,6 +23,10 @@ pub struct BrowseState {
     pub error: Option<String>,
     pub install_error: Option<String>,
     pub result_version: u64,
+    /// The [`progress_key`] of the package being installed, not its id: two
+    /// managers can offer the same name, and only one of them is installing.
+    ///
+    /// [`progress_key`]: crate::core::adapter::progress_key
     pub installing: Option<String>,
     pub selected_package: Option<Package>,
     pub selected_detail: Option<crate::core::package::PackageDetail>,
@@ -379,9 +383,8 @@ impl App {
             .selected
             .contains(&crate::core::adapter::package_key(&pkg.adapter_id, &pkg.id));
         let pkey = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
-        let is_installing = self.browse_state.installing.is_some()
-            && (self.browse_state.installing.as_deref() == Some(&pkg.id)
-                || self.browse_state.package_progress.contains_key(&pkey));
+        let is_installing = self.browse_state.installing.as_deref() == Some(pkey.as_str())
+            || self.browse_state.package_progress.contains_key(&pkey);
         let pkg_status = self.browse_state.package_progress.get(&pkey);
 
         // Header: name + version badge + adapter badge
@@ -872,7 +875,7 @@ impl App {
                 .package_progress
                 .get(&detail_pkey)
                 .is_some_and(|status| !status.is_finished())
-                || self.browse_state.installing.as_deref() == Some(&pkg.id);
+                || self.browse_state.installing.as_deref() == Some(detail_pkey.as_str());
             if is_installing {
                 // The panel is narrow and shares its width with Close, so the
                 // status says the least that still means something.

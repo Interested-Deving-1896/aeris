@@ -26,6 +26,11 @@ pub struct UpdatesState {
     pub checked: bool,
     pub error: Option<String>,
     pub result_version: u64,
+    /// What is being updated: a package's [`progress_key`], a manager's id when
+    /// it is updating everything it holds, or `__all__` / `__batch__`. Packages
+    /// carry their manager because two managers can offer the same name.
+    ///
+    /// [`progress_key`]: crate::core::adapter::progress_key
     pub updating: Option<String>,
     pub limits: Vec<ManagerLimit>,
     pub selected: HashSet<String>,
@@ -429,7 +434,7 @@ impl App {
         let pkey =
             crate::core::adapter::progress_key(&update.package.adapter_id, &update.package.id);
         let pkg_status = self.updates_state.package_progress.get(&pkey);
-        let is_updating_this = self.updates_state.updating.as_deref() == Some(&update.package.id);
+        let is_updating_this = self.updates_state.updating.as_deref() == Some(pkey.as_str());
         let is_updating_all = self.updates_state.updating.as_deref() == Some("__all__");
         let is_updating_batch =
             self.updates_state.updating.as_deref() == Some("__batch__") && pkg_status.is_some();

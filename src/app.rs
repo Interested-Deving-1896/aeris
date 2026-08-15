@@ -4832,7 +4832,7 @@ impl App {
         let pkg_name = pkg.name.clone();
         let adapter_id = pkg.adapter_id.clone();
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
-        self.browse_state.installing = Some(package_id.clone());
+        self.browse_state.installing = Some(progress_key.clone());
         self.browse_state
             .package_progress
             .insert(progress_key.clone(), OperationStatus::Starting);
@@ -5063,11 +5063,12 @@ impl App {
             return;
         };
 
-        self.updates_state.updating = Some(pkg.id.clone());
-        self.installed_state.updating = Some(pkg.id.clone());
-
         // Stands in until the manager says something of its own.
         let progress_key = crate::core::adapter::progress_key(&pkg.adapter_id, &pkg.id);
+
+        self.updates_state.updating = Some(progress_key.clone());
+        self.installed_state.updating = Some(progress_key.clone());
+
         self.start_output_log(&progress_key);
         self.record_progress(progress_key.clone(), OperationStatus::Starting);
         cx.notify();
