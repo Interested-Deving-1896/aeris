@@ -1,29 +1,33 @@
 # aeris
 
-**Unbounded package management.** A graphical package manager built with Rust and [GPUI](https://gpui.rs).
+**Manages your package managers.** A desktop front end for the ones you
+already have, built with Rust and [GPUI](https://gpui.rs).
 
 ## Overview
 
-Aeris is a desktop GUI for searching, installing, updating, and removing
-packages. It drives each package manager as a command, described by a TOML
-manifest, so one interface fronts several of them at once.
+Most Linux systems end up with more than one package manager. Aeris does not
+add another. It searches, installs, updates and removes through the ones
+already installed, and shows the result as one list rather than several.
+
+It never installs anything itself. Every operation is a command, described by
+a TOML manifest that says what to run and how to read what comes back. Adding
+a manager is writing a manifest rather than changing aeris.
 
 [soar](https://github.com/pkgforge/soar) is built in and describes itself, so
-Aeris always drives the soar that is actually installed. Other managers are
-added at runtime from the
-[adapter registry](https://github.com/pkgforge/aeris-registry), so supporting
-one is a matter of writing a manifest rather than changing Aeris.
+aeris drives whichever soar is actually installed. Others are added at runtime
+from the [adapter registry](https://github.com/pkgforge/aeris-registry).
 
 ## Features
 
 - Search every enabled manager at once, ranked by how well each result answers
-- Install, update, and remove packages
+- Install, update and remove packages, and run what you installed
+- Narrow a search to the managers you pick
 - Work per user or system wide, for a manager that offers both
+- Watch a manager work, in its own words, and answer it when it stops to ask
+- See what a manager holds, what it can update, and what it cannot tell you
 - Add adapters from the registry, refreshed on an interval and offered as updates
-- View installed packages and available updates
 - Declarative manifest view: edit `packages.toml`, preview the diff, and apply
 - Per package detail panel with source, build, and option fields
-- Live progress, including answering a manager that stops to ask something
 
 ## Install
 
@@ -43,7 +47,8 @@ chmod +x aeris-x86_64-linux.onelf
 ```
 
 Nightly builds are published on the rolling
-[`nightly`](https://github.com/pkgforge/aeris/releases/tag/nightly) tag.
+[`nightly`](https://github.com/pkgforge/aeris/releases/tag/nightly) tag, and
+are cut only when there is something new to build.
 
 ### From source
 
@@ -68,6 +73,11 @@ to read what comes back, so a manager that already answers in JSON needs
 nothing more than a description. A manifest also says how the manager acts
 system wide, which settings it accepts, and whether an operation needs a
 terminal.
+
+What a manager can do follows from what its manifest declares, and aeris
+offers only that. A manager that cannot say which packages have updates is
+asked to update everything at once rather than one package at a time, and says
+so on the page rather than failing when pressed.
 
 Manifests are read from, in order:
 

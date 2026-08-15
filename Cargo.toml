@@ -2,7 +2,7 @@
 name = "aeris"
 version = "0.1.0"
 edition = "2024"
-description = "Unbounded package management"
+description = "Manages your package managers"
 license = "MIT"
 repository = "https://github.com/pkgforge/aeris"
 readme = "README.md"

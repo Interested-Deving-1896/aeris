@@ -6,7 +6,7 @@ name = "aeris"
 command = "bin/aeris"
 output = "aeris.onelf"
 version = "0.0.0"
-description = "Unbounded package management"
+description = "Manages your package managers"
 license = "MIT"
 homepage = "https://github.com/pkgforge/aeris"
 
